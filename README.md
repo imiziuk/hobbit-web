@@ -16,10 +16,23 @@ Requirements: **Python 3.10+**, **Chrome or Edge 137+** (it uses WebAssembly JSP
 Node.js is optional.
 
 ```
-python start.py --game "D:\Games\The Hobbit"      # first run: the folder that contains Meridian.exe
-python start.py                                   # later runs remember the folder
+python start.py
 ```
-On Windows you can double-click `start.bat` instead; on the first run, pass the folder: `start.bat "D:\Games\The Hobbit"`.
+On Windows you can also double-click `start.bat`.
+
+**Finding your game folder:** the first run looks for it in this order, then remembers the answer in `config.json`
+(gitignored, so every developer keeps their own path):
+1. `--game "<folder>"`, if you pass it;
+2. the folder saved in `config.json`, if it still contains the game;
+3. the `HOBBIT_GAME_DIR` environment variable;
+4. a `game/` folder inside or next to the repo (a copy, or a link: `mklink /J game "D:\Games\The Hobbit"`);
+5. the Windows uninstall registry (where the installer put it);
+6. the usual install folders on drives C: to H: (`Program Files (x86)\Sierra\The Hobbit` and similar), plus folders
+   named like "hobbit" in Downloads, Games, Desktop and Documents;
+7. otherwise it lists what it found, or asks you to type the path.
+
+A folder counts as the game if it has `Meridian.exe` and `common.DFS`. Use `python start.py --find` to search again,
+or `--game` to point it somewhere else.
 
 The first run takes a few minutes. It sets up `.venv` (capstone, pefile) and downloads wasi-sdk 34, which is clang for
 WebAssembly (~120 MB, into `tools/`). Then it translates the exe to C and compiles `recomp/out/hobbit_flat.wasm`

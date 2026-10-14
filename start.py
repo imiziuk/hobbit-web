@@ -1,12 +1,14 @@
 """One-command launcher for Hobbit Web (The Hobbit 2003, recompiled to WebAssembly, running in Chrome).
 
-    python start.py --game "D:\\Games\\The Hobbit"     first run: remembers the folder in config.json
-    python start.py                                   later runs
+    python start.py                                   finds the game by itself (or asks), remembers it in config.json
+    python start.py --game "D:\\Games\\The Hobbit"     use this folder (also remembered)
+    python start.py --find                            forget the saved folder and search again
     python start.py --rebuild                         force re-translation + rebuild
     python start.py --no-browser --port 5190
 
 What it does, in order:
- 1. checks your game folder (Meridian.exe + the .DFS archives) and the exe's checksum,
+ 1. finds your game folder (find_game: --game, config.json, HOBBIT_GAME_DIR, a game/ folder next to this repo,
+    the Windows uninstall registry, common install folders; otherwise it asks) and checks Meridian.exe + archives,
  2. creates .venv with capstone + pefile (translator dependencies),
  3. downloads wasi-sdk 34 (clang for WebAssembly) into tools/ if WASI_SDK is not set,
  4. translates Meridian.exe to C and compiles recomp/out/hobbit_flat.wasm (first run: a few minutes),
@@ -40,15 +42,142 @@ def find_exe(game):
     return None
 
 
-def check_game(game):
+def game_problem(game):
+    """None if `game` is an installed game folder, else the reason it is not."""
     if not game or not os.path.isdir(game):
-        die("game folder not found. Run:  python start.py --game \"<folder that contains Meridian.exe>\"")
+        return "folder not found"
+    try:
+        names = [n.lower() for n in os.listdir(game)]
+    except OSError as e:
+        return str(e)
+    if "meridian.exe" not in names:
+        return "no Meridian.exe in it"
+    if "common.dfs" not in names:
+        return "no common.DFS in it (point at the installed game folder, not the CD or the installer)"
+    return None
+
+
+def _registry_installs():
+    """InstallLocation of every uninstall entry whose name contains 'Hobbit' (Windows only)."""
+    out = []
+    try:
+        import winreg
+    except ImportError:
+        return out
+    keys = ((winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"))
+    for root, key in keys:
+        try:
+            h = winreg.OpenKey(root, key)
+        except OSError:
+            continue
+        for i in range(winreg.QueryInfoKey(h)[0]):
+            try:
+                sub = winreg.OpenKey(h, winreg.EnumKey(h, i))
+                if "hobbit" not in str(winreg.QueryValueEx(sub, "DisplayName")[0]).lower():
+                    continue
+            except OSError:
+                continue
+            for v in ("InstallLocation", "InstallDir", "DisplayIcon"):
+                try:
+                    val = str(winreg.QueryValueEx(sub, v)[0]).strip('"').split(",")[0]
+                except OSError:
+                    continue
+                out.append(os.path.dirname(val) if val.lower().endswith(".exe") else val)
+    return out
+
+
+def candidates():
+    """Places a Hobbit install usually lives, most specific first."""
+    seen, out = set(), []
+
+    def add(p):
+        if p:
+            p = os.path.normpath(os.path.expandvars(os.path.expanduser(p)))
+            if p.lower() not in seen:
+                seen.add(p.lower())
+                out.append(p)
+
+    add(os.environ.get("HOBBIT_GAME_DIR"))
+    for base in (HERE, os.path.dirname(HERE)):          # a game/ (or similar) folder inside or next to the repo
+        for n in ("game", "Game", "The Hobbit", "Hobbit", "hobbit"):
+            add(os.path.join(base, n))
+    drives = []
+    if os.name == "nt":
+        for p in _registry_installs():                  # installers record where they put the game
+            add(p)
+        drives = [d + ":\\" for d in "CDEFGH" if os.path.exists(d + ":\\")]
+        for d in drives:
+            for rel in (r"Program Files (x86)\Sierra\The Hobbit", r"Program Files\Sierra\The Hobbit",
+                        r"Program Files (x86)\Vivendi Universal Games\The Hobbit", r"Program Files (x86)\The Hobbit",
+                        r"Program Files\The Hobbit", r"Games\The Hobbit", r"Games\Hobbit", "The Hobbit"):
+                add(os.path.join(d, rel))
+    else:                                               # Wine / CrossOver prefixes on Linux and macOS
+        for pre in ("~/.wine/drive_c", "~/Games"):
+            for rel in ("Program Files (x86)/Sierra/The Hobbit", "Program Files/Sierra/The Hobbit", "The Hobbit"):
+                add(os.path.join(pre, rel))
+    # two levels under the usual roots: any folder whose name contains "hobbit", and its subfolders
+    roots = [os.path.join(os.path.expanduser("~"), n) for n in ("Downloads", "Games", "Desktop", "Documents")]
+    roots += [os.path.join(d, n) for d in drives for n in ("Games", "Program Files (x86)", "Program Files")]
+    for r in roots:
+        try:
+            names = os.listdir(r)
+        except OSError:
+            continue
+        for n in names:
+            if "hobbit" not in n.lower():
+                continue
+            add(os.path.join(r, n))
+            try:
+                for m in os.listdir(os.path.join(r, n)):
+                    add(os.path.join(r, n, m))
+            except OSError:
+                pass
+    return out
+
+
+def find_game(given, saved, refind):
+    """--game > config.json > automatic search > ask. Returns the game folder."""
+    if given:
+        game = os.path.abspath(given)
+        why = game_problem(game)
+        if why:
+            die(f"--game {game}: {why}")
+        return game
+    if saved and not refind:
+        why = game_problem(saved)
+        if not why:
+            return saved
+        say(f"the saved game folder {saved} is not usable any more ({why}); searching again")
+    say("looking for The Hobbit...")
+    found = [c for c in candidates() if not game_problem(c)]
+    if len(found) == 1:
+        say(f"found the game: {found[0]}")
+        return found[0]
+    if found:
+        say("found more than one game folder:")
+        for i, f in enumerate(found, 1):
+            say(f"  {i}. {f}")
+    else:
+        say("could not find it automatically.")
+    if not sys.stdin or not sys.stdin.isatty():
+        die('run:  python start.py --game "<folder that contains Meridian.exe>"')
+    while True:
+        prompt = "Type a number or a folder path: " if found else "Where is The Hobbit installed? (folder with Meridian.exe): "
+        ans = input("[hobbit-web] " + prompt).strip().strip('"')
+        if found and ans.isdigit() and 1 <= int(ans) <= len(found):
+            return found[int(ans) - 1]
+        game = os.path.abspath(os.path.expanduser(ans)) if ans else ""
+        why = game_problem(game)
+        if not why:
+            return game
+        say(f"  {game or '(nothing typed)'}: {why}")
+
+
+def check_game(game):
     exe = find_exe(game)
-    if not exe:
-        die(f"no Meridian.exe in {game}")
     dfs = [f for f in os.listdir(game) if f.lower().endswith(".dfs")]
-    if not any(f.lower() == "common.dfs" for f in dfs):
-        die(f"{game} has no common.DFS: point --game at the installed game folder")
     md5 = hashlib.md5(open(exe, "rb").read()).hexdigest()
     if md5 in KNOWN_MD5:
         say(f"Meridian.exe OK ({KNOWN_MD5[md5]}), {len(dfs)} archives")
@@ -138,16 +267,18 @@ def serve(game, port, open_browser):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--game", help="installed game folder (contains Meridian.exe and *.DFS)")
+    ap.add_argument("--game", help="installed game folder (contains Meridian.exe and *.DFS); default: saved or auto-detected")
+    ap.add_argument("--find", action="store_true", help="ignore the saved folder and search for the game again")
     ap.add_argument("--port", type=int, default=5190)
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--no-browser", action="store_true")
     a = ap.parse_args()
     cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
-    game = os.path.abspath(a.game) if a.game else cfg.get("game_dir")
+    game = find_game(a.game, cfg.get("game_dir"), a.find)
     exe = check_game(game)
-    if a.game:
+    if game != cfg.get("game_dir"):
         json.dump({"game_dir": game}, open(CONFIG, "w"), indent=2)
+        say("remembered in config.json (change it with --game or --find)")
     if not shutil.which("node"):
         say("note: Node.js is optional (only for the headless runner recomp/boot_node.mjs)")
     build(exe, a.rebuild)

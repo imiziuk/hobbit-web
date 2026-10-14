@@ -39,6 +39,7 @@ services:
     image: tailscale/tailscale:stable
     container_name: hobbit-tailscale
     hostname: hobbit-web
+    user: "${TS_UID:-1001}:${TS_GID:-1001}"   # owner of ./ts-state (700); userspace mode needs no root
     cap_drop: [ALL]
     mem_limit: 256m
     environment:

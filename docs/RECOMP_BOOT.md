@@ -27,7 +27,7 @@ was loaded. The menu text is the game's own bitmap font (section 6), not D3DXFon
 | `recomp/host/machine.mjs` | wasm instance, memory views, PE image mapping, IAT binding, host-call protocol, guest heap, TEB/FS, green-thread scheduler, clocks |
 | `recomp/host/pe.mjs` | PE sections + import directory |
 | `recomp/host/win32.mjs` | KERNEL32/USER32/GDI32/SHELL32/WINMM/binkw32/shfolder shims, MSLU W functions, fake DLL images, message queue, SEH |
-| `recomp/host/dx.mjs` | DirectInput8 + DirectSound8 host COM objects; D3D8 via `web/d3d8/com.js` ComBridge; `nullGL()` for Node |
+| `recomp/host/dx.mjs` | DirectInput8 + DirectSound8 host COM objects (sound: `dsmix.mjs` mixer, `web/audio.mjs` + `web/audio-worklet.js`); D3D8 via `web/d3d8/com.js` ComBridge; `nullGL()` for Node |
 | `recomp/host/vfs.mjs`, `node_fs.mjs` | path mapping (`C:\HOBBIT` = game folder read-only, `C:\APPDATA` = settings), Node fs backend, HTTP Range backend (64 KB blocks: memory cache, then the persistent Cache API store `hobbit-data-v1` keyed by file + manifest version + size, then one Range request per run of missing blocks; no store in Node), memory backend |
 | `recomp/boot_node.mjs` | headless runner; writes `recomp/out/boot/{boot.log, summary.json, files.txt, entered.txt}` |
 | `recomp/serve_game.py` | read-only Range + CORS server for the game folder on 127.0.0.1:5191, `/__manifest` (`[path, size, version]`), ETag on every response, `?v=` URLs immutable (launch.json `hobbit-game-data`); `serve_path()` is reused by `start.py --single` under `/data/` |
@@ -48,7 +48,7 @@ Single-origin alternative (what Docker and Cloudflare Access use): `python Hobbi
 `no-cache` revalidation. Measured first vs repeat visit: menu 170 req / 20.3 MB vs 14 req / 7 KB; Dream World ~580 req /
 ~49 MB vs 14 req / 7 KB (0 game-data requests).
 Runner options: `--frames N`, `--seconds S`, `--trace N` (log the first N host calls), `--keys frame:DIK[:len],...`,
-`--vis-reset <addr>` (functions entered after a milestone), `--peek addr,...`.
+`--vis-reset <addr>` (functions entered after a milestone), `--peek addr,...`, `--dstrace N` (log the first N DirectSound calls), `--audio-wav f.wav` (offline mix, see "Audio").
 
 ## 3. Memory and the host-call protocol
 - Linear memory = guest address space: wasm data + C shadow stack below 0x00400000, exe image at 0x00400000 (headers +
@@ -112,7 +112,7 @@ That needs multi-entry functions or a "resume at address" path in the translator
 
 ## 8. Known gaps / next steps
 1. Bink decoding (frames are black; a Bink 1 decoder in a worker, or transcoded WebM per WEB_PORT_THREADS.md).
-2. DirectSound -> WebAudio (buffers exist in guest memory, play cursors follow the clock; nothing is audible).
+2. ~~DirectSound -> WebAudio~~ done Oct 14, see "Audio" below. Bink movie audio is still silent.
 3. New Game -> LoadLevel (not tried yet); C++ exception continuations if a level load throws.
 4. HLE of D3DX texture loading if the recompiled path is too slow (9,600 CheckDeviceFormat calls at boot).
 5. Settings files are not persisted in the browser (MemBackend); Node writes them to `recomp/out/appdata`.
@@ -159,3 +159,55 @@ That needs multi-entry functions or a "resume at address" path in the translator
 - Tested in the browser pane (synthetic touch PointerEvents, 800x450 and a 640x360 emulated phone): D-pad 1 step per tap,
   canvas taps, New Game, Start skips the movie and the cutscenes, the left stick runs Bilbo (moved ~350 units in 1.5 s), A jumps (Y +94),
   camera drag rotates the view, Start pauses, B resumes, checkbox off restores the desktop layout. Not tried on a real phone.
+
+## Audio (Oct 14)
+The game does its own audio work and only needs plain DirectSound: it decodes IMA ADPCM (36-byte blocks -> 64 samples,
+0067b860) into **16-bit mono PCM** secondary buffers (flags 0x500c0 = CTRLPAN|CTRLVOLUME|GETCURRENTPOSITION2|GLOBALFOCUS,
+no 3D), and refills streams from the main thread by polling the play cursor (0067b260). So the port makes the
+DirectSound stub real instead of replacing any game code.
+
+**Pipeline.** `recomp/host/dx.mjs installDirectSound(m, W, S, out)` keeps the buffers in guest memory (Lock returns
+pointers into them). Each buffer has timeline segments `{t0, c0, rate, loop}`; the play cursor at time t is
+`c0 + (t - t0) * rate`. Every state change (Play, Stop, SetCurrentPosition, SetFrequency, SetVolume) takes effect at
+`now + lead` (50 ms in the browser) and is posted with that time to the mixer; Unlock posts a copy of the written
+bytes. The mixer (`recomp/host/dsmix.mjs`, linear resampling, DirectSound volume/pan in hundredths of a dB, primary
+buffer volume = master) applies each change on exactly that output frame, so the cursor the game polls is the one being
+played. Write cursor = play cursor + lead + 15 ms.
+- Browser: `web/audio.mjs` -> `AudioWorkletNode('ds-mixer')` (`web/audio-worklet.js`, the same mixer on the audio
+  thread) -> analyser -> user gain -> speakers. No SharedArrayBuffer (no COOP/COEP needed); messages only.
+  Not a secure context (plain-http LAN page): the same mixer runs in a ScriptProcessorNode on the main thread.
+- Clock: while the AudioContext runs, the timeline is `ctx.currentTime`; before the first gesture (autoplay policy)
+  or while suspended, it is `performance.now()` so sounds still start and end for the game. On every switch all live
+  buffers are re-sent (`W.ds.resync()`): measured, suspend 2 s -> resume -> "7 live buffers resent", sound continues.
+- Node: no `out` = silent, the timeline is the virtual clock (same behaviour as the old stub).
+  `boot_node.mjs --audio-wav f.wav [--audio-seconds N]` renders the mix offline with the same mixer.
+- Page: "Sound" checkbox + volume slider (`localStorage` `hobbit.mute`, `hobbit.vol`; gain = slider^2), status line
+  `sound N voices -18 dB`; `hobbit.audio.capture(sec)` -> `{rms, peak, wav}` and `hobbit.audio.rmsLog` for tests;
+  `hobbit.W.ds.status()` lists the live buffers.
+
+**DirectSound subset used by the game** (measured call counts after ~4 min in Dream World): CreateSoundBuffer 1,444,
+Play 1,429, Stop 1,450, SetCurrentPosition 1,443, SetVolume 11,567, Lock/Unlock 2,913, GetCurrentPosition 10,623,
+GetStatus 18,669, GetCaps 1,697, AddRef/Release, plus SetCooperativeLevel, IDirectSound8::GetCaps, primary SetFormat
+once. Never called: SetPan, SetFrequency (implemented; pitch path 0067be50 flag 4), DuplicateSoundBuffer (implemented),
+QueryInterface, 3D interfaces. DSCAPS reports no hardware mixing, like DirectSound on Vista+, so the game uses 16
+voices (0067b470 clamps caps+0x14 to 16..64).
+
+**What the game does with it.**
+- One-shot sounds: a new buffer per play, sample + 0x2274 bytes of silence (0067bad0), Release when done.
+- Streams: 0x40000-byte buffers in two 0x20000 halves, refilled (0x9000 ADPCM bytes per half) when the cursor
+  leaves a half (0067b260; wrap detected when the cursor drops below the previous value). Measured: every refill was
+  written into the half that was not playing (e.g. half 0 written at cursor 132,860).
+- **Stereo = two mono buffers.** Streams and stereo samples are one voice per channel; the voice record holds a pan
+  of -1/+1 (float at voice+0x34, gains 0.707 at +0x38/+0x3c), but the PC build's update (0067be50) clears the pan
+  flag (2) without calling SetPan. The original PC game therefore plays both channels centred, and so does the port.
+  A "true stereo" option would have to read voice+0x34; not done (not faithful).
+- Front end: only UI sounds (two 21,108-byte voices per menu move, -14.9 dB); no music buffer is created in the menu
+  in this build (the intro/menu music, if any, would be Bink audio, out of scope).
+
+**Evidence** (`recomp/out/audio/`, gitignored): `browser_dreamworld.wav` = 8 s captured from the worklet output in Dream
+World while running (48 kHz stereo; RMS 0.13-0.38 per 0.5 s, peak 1.0 with 474 clipped samples of 768,000, longest
+digital silence 0.02 ms = no stream gaps), 2-14 voices playing; `node_menu.wav` = Node offline render of the boot
+(the PressStart sound at 5 s, RMS 0.019). Frame rate with sound: 29 fps, heap stable at 61 MB.
+
+Known gaps: Bink audio; no DS3D (the game does not use it); sound names are not shown (the voice -> AUDIOPKG
+descriptor link is not mapped); clipping is hard (as DirectSound).

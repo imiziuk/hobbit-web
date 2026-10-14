@@ -5,7 +5,8 @@ instruction by instruction into WebAssembly. Windows, DirectX 8, DirectInput and
 browser code (WebGL2, keyboard events, Web Audio).
 
 Status (Oct 14, 2026): boots through the legal screen and main menu into **Dream World, and Bilbo is playable**.
-No sound yet, movies are black, and C++ exceptions can't resume yet, so expect crashes past the first area.
+Sound works (effects, voices, ambience and music through Web Audio; it starts on your first click or key press,
+volume slider + Sound checkbox above the game). Movies are black and silent, and C++ exceptions can't resume yet, so expect crashes past the first area.
 
 > You need your **own installed copy** of the game. This repo contains no game files and no translated game code;
 > both are produced locally from your copy. Keep the repo private.
@@ -225,15 +226,15 @@ Docs: `docs/RECOMP.md` (translator), `docs/RECOMP_BOOT.md` (boot, host layer, ru
 | `start.py`, `start.bat` | launcher (setup, build, servers; `--single` = one-port server) |
 | `docker-compose.yml`, `Dockerfile`, `.env.example`, `tailscale/` | Docker: game + Tailscale node, optional `cloudflared` (profile `cloudflare`) |
 | `recomp/` | translator (`cfg.py`, `x86c.py`), `build.py`, C runtime, JS host layer, headless Node runner `boot_node.mjs`, capsule harness |
-| `web/` | `game.html` / `game.mjs` (the game page), `touch.mjs` (phone controls), `d3d8/` (Direct3D 8 on WebGL2 + its self-test `d3d8/test.html`) |
+| `web/` | `game.html` / `game.mjs` (the game page), `touch.mjs` (phone controls), `audio.mjs` + `audio-worklet.js` (DirectSound output), `d3d8/` (Direct3D 8 on WebGL2 + its self-test `d3d8/test.html`) |
 | `auto/` | function boundaries, ABI table and cross-references for this exact exe (from the Ghidra analysis) |
 | `d3drec/` | proxy `d3d8.dll` that records the original game's D3D calls + a Chrome replayer that diffs the frames |
 
 Headless run (no browser): `node --experimental-wasm-jspi recomp/boot_node.mjs --frames 4000`. Set `HOBBIT_GAME_DIR`
-and `HOBBIT_EXE`, or use the default sibling paths.
+and `HOBBIT_EXE`, or use the default sibling paths. `--audio-wav out.wav` also writes what the speakers would play.
 
 ## Not done yet
-- Sound: DirectSound → Web Audio.
+- Movie sound (Bink audio): movies are silent.
 - Bink movies: they play black for their real length.
 - Resuming C++ exceptions.
 - Saving settings in the browser.

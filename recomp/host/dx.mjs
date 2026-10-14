@@ -1,6 +1,7 @@
 // DirectInput 8 and DirectSound 8 as host COM objects (vtables of host thunks in guest memory), and the glue that
 // plugs web/d3d8/com.js (ComBridge: IDirect3D8 / IDirect3DDevice8 / resources) into the host-call protocol.
 import { hex } from './machine.mjs';
+import { dsGains } from './dsmix.mjs';
 
 /** Host COM class: methods = [[name, nargs, fn(self, args)] ...] in vtable order (IUnknown first). */
 export class ComClass {
@@ -10,6 +11,7 @@ export class ComClass {
     methods.forEach(([name, nargs, fn], i) => {
       const a = m.defineHle(iface + '::' + name, nargs + 1, (args) => {
         const self = m.comObjs.get(args[0]);
+        if (m.comTrace) m.comTrace(iface, name, args, self);
         if (!fn) { m.log(`unimplemented ${iface}::${name}`); return 0x80004001; }
         return fn(self, args.slice(1));
       });
@@ -158,53 +160,177 @@ export function installDirectInput(m, W, S) {
   S.set('dinput8.dll!DirectInput8Create', { nargs: 5, fn: ([hinst, ver, riid, ppv]) => { m.w32(ppv, diCls.create({})); return 0; } });
 }
 
-/* ------------------------------------------------------------------ DirectSound 8 (silent; play cursors follow the clock) */
-export function installDirectSound(m, W, S) {
-  const pos = s => {
-    if (!s.playing || !s.size) return s.cursor || 0;
-    const ms = m.clock.now() - s.t0;
-    const p = Math.floor(ms * s.bps / 1000);
-    return s.loop ? (s.cursor0 + p) % s.size : Math.min(s.size, s.cursor0 + p);
+/* ------------------------------------------------------------------ DirectSound 8
+ * Buffers live in guest memory: the game Locks, writes PCM it decoded itself (IMA ADPCM, 0067b860) and Unlocks. Each
+ * buffer keeps a list of timeline segments {t0, c0, rate, loop}: the play cursor at time t is c0 + (t - t0) * rate.
+ * `out` (optional) is the audio backend { now(): seconds, lead: seconds, post(cmd, transfer) } (web/audio.mjs). Every
+ * state change takes effect at now() + lead and is posted with that time (`at`) to the mixer (recomp/host/dsmix.mjs),
+ * so the cursor the game polls is the position the mixer plays. Without `out` (Node) the timeline is the machine
+ * clock and nothing is played (boot_node.mjs --audio-wav attaches the offline renderer). */
+export function installDirectSound(m, W, S, out) {
+  const be = out || { now: () => m.clock.now() / 1000, lead: 0, post() {} };
+  const DS = W.ds = { buffers: new Set(), created: 0, plays: 0 };
+  let nextId = 1;
+  const segAt = (s, t) => { const g = s.segs; let i = g.length - 1; while (i > 0 && g[i].t0 > t) i--; return g[i]; };
+  const rawPos = (s, t) => { const g = segAt(s, t); return g.rate ? g.c0 + Math.max(0, t - g.t0) * g.rate : g.c0; };
+  const isPlaying = (s, t) => { const g = segAt(s, t); return !!g.rate && (g.loop || rawPos(s, t) < s.size); };
+  const pos = (s, t) => {
+    const g = segAt(s, t), p = rawPos(s, t);
+    if (!g.rate || !s.size) return Math.min(p, s.size || 0);
+    return g.loop ? p % s.size : (p >= s.size ? 0 : p);     // a one-shot that played to its end stops at 0
   };
+  const pushSeg = (s, seg) => {
+    const now = be.now();
+    s.segs = s.segs.filter((g, i, a) => g.t0 < seg.t0 && !(a[i + 1] && a[i + 1].t0 <= now)); s.segs.push(seg);
+  };
+  const T = () => be.now() + be.lead;
+  const cur = (s, t) => Math.floor(pos(s, t) / s.align) * s.align;
+  const writeLead = s => Math.ceil((be.lead + 0.015) * s.freq) * s.align;    // DirectSound's write cursor runs ~15 ms ahead
+  const post = (c, tr) => be.post(c, tr);
+  const fmt = wfx => { const dv = new DataView(wfx.buffer, wfx.byteOffset); return { tag: dv.getUint16(0, true), ch: dv.getUint16(2, true) || 1, rate: dv.getUint32(4, true) || 22050, align: dv.getUint16(12, true) || 2, bits: dv.getUint16(14, true) || 16 }; };
+  const setGains = s => { const [gl, gr] = dsGains(s.vol, s.pan); post({ op: 'set', id: s.id, at: T(), gl, gr }); };
+  const newBuffer = st => {
+    st.id = nextId++; st.segs = [{ t0: -1e9, c0: 0, rate: 0, loop: false }]; st.vol = 0; st.pan = 0;
+    if (!st.primary) { post({ op: 'voice', id: st.id, data: st.data.id }); post({ op: 'set', id: st.id, at: T(), freq: st.freq, gl: 1, gr: 1 }); }
+    DS.buffers.add(st); DS.created++;
+    return bufCls.create(st);
+  };
+  const release = s => {
+    if (--s.refs > 0) return s.refs;
+    if (s.dead) return 0; s.dead = true; s.refs = 0;
+    DS.buffers.delete(s); m.comObjs.delete(s.ptr);
+    if (!s.primary) {
+      const t = T();                       // after any Stop that is still pending in the mixer
+      post({ op: 'free', id: s.id, at: t });
+      if (--s.data.refs === 0) { post({ op: 'freeData', id: s.data.id, at: t }); if (s.data.mem) m.heap.release(s.data.mem); }
+    }
+    return 0;
+  };
+  const IID_DSB8 = '49a425682475824d920f50e36ab3ab1e', IID_DSB = '8ab4ac279a6dc311a6bd0020af0be560', IID_UNK = '00000000000000000c00000000000046';
   const bufCls = new ComClass(m, 'IDirectSoundBuffer8', [
-    ['QueryInterface', 2, (s, [riid, pp]) => { m.w32(pp, s.ptr); s.refs++; return 0; }], ['AddRef', 0, s => ++s.refs], ['Release', 0, s => Math.max(0, --s.refs)],
-    ['GetCaps', 1, (s, [p]) => { m.w32(p + 4, s.flags); m.w32(p + 8, s.size); return 0; }],
-    ['GetCurrentPosition', 2, (s, [pp, pw]) => { const c = pos(s) & ~3; if (pp) m.w32(pp, c); if (pw) m.w32(pw, s.size ? (c + 1764 * 4) % s.size : 0); return 0; }],
-    ['GetFormat', 3, (s, [p, n, pw]) => { if (p) m.u8.set(s.wfx, p); if (pw) m.w32(pw, 18); return 0; }],
+    ['QueryInterface', 2, (s, [riid, pp]) => {
+      const g = guid(m, riid);
+      if (g === IID_DSB8 || g === IID_DSB || g === IID_UNK) { m.w32(pp, s.ptr); s.refs++; return 0; }
+      m.log('IDirectSoundBuffer8::QueryInterface: no interface ' + g); m.w32(pp, 0); return 0x80004002 | 0;
+    }],
+    ['AddRef', 0, s => ++s.refs], ['Release', 0, s => release(s)],
+    ['GetCaps', 1, (s, [p]) => { m.w32(p + 4, s.flags); m.w32(p + 8, s.size); m.w32(p + 12, 0); m.w32(p + 16, 0); return 0; }],
+    ['GetCurrentPosition', 2, (s, [pp, pw]) => {
+      if (!s.size) { if (pp) m.w32(pp, 0); if (pw) m.w32(pw, 0); return 0; }
+      const t = be.now(), c = cur(s, t);
+      if (pp) m.w32(pp, c); if (pw) m.w32(pw, (c + (isPlaying(s, t) ? writeLead(s) : 0)) % s.size); return 0;
+    }],
+    ['GetFormat', 3, (s, [p, n, pw]) => { if (p) m.u8.set(s.wfx.subarray(0, Math.min(18, n || 18)), p); if (pw) m.w32(pw, 18); return 0; }],
     ['GetVolume', 1, (s, [p]) => { m.w32(p, s.vol | 0); return 0; }], ['GetPan', 1, (s, [p]) => { m.w32(p, s.pan | 0); return 0; }],
     ['GetFrequency', 1, (s, [p]) => { m.w32(p, s.freq); return 0; }],
-    ['GetStatus', 1, (s, [p]) => { if (s.playing && !s.loop && pos(s) >= s.size) s.playing = false; m.w32(p, s.playing ? (1 | (s.loop ? 4 : 0)) : 0); return 0; }],
+    ['GetStatus', 1, (s, [p]) => { const t = be.now(); m.w32(p, !s.primary && isPlaying(s, t) ? (1 | (segAt(s, t).loop ? 4 : 0)) : 0); return 0; }],
     ['Initialize', 2, () => 0],
     ['Lock', 7, (s, [off, n, pp1, pn1, pp2, pn2, fl]) => {
-      if (fl & 2) { off = 0; n = s.size; } if (fl & 1) off = pos(s);
-      if (!s.size) { m.w32(pp1, 0); m.w32(pn1, 0); return 0x88780032 | 0; }
+      if (!s.size) { m.w32(pp1, 0); m.w32(pn1, 0); return 0x88780032 | 0; }      // DSERR_INVALIDCALL (primary buffer)
+      if (fl & 2) { off = 0; n = s.size; }                                          // DSBLOCK_ENTIREBUFFER
+      if (fl & 1) { const t = be.now(); off = cur(s, t) + (isPlaying(s, t) ? writeLead(s) : 0); }   // DSBLOCK_FROMWRITECURSOR
       off %= s.size; n = Math.min(n, s.size);
       const n1 = Math.min(n, s.size - off);
-      m.w32(pp1, s.mem + off); m.w32(pn1, n1);
-      if (pp2) m.w32(pp2, n > n1 ? s.mem : 0); if (pn2) m.w32(pn2, n - n1);
+      m.w32(pp1, s.data.mem + off); m.w32(pn1, n1);
+      if (pp2) m.w32(pp2, n > n1 ? s.data.mem : 0); if (pn2) m.w32(pn2, n - n1);
       return 0;
     }],
-    ['Play', 3, (s, [r, p, fl]) => { if (!s.playing) { s.playing = true; s.t0 = m.clock.now(); s.cursor0 = s.cursor || 0; } s.loop = !!(fl & 1); return 0; }],
-    ['SetCurrentPosition', 1, (s, [c]) => { s.cursor = c; s.cursor0 = c; s.t0 = m.clock.now(); return 0; }],
+    ['Play', 3, (s, [r, prio, fl]) => {
+      if (s.primary) return 0;
+      const loop = !!(fl & 1), t = T(), was = isPlaying(s, t);
+      if (was && segAt(s, t).loop === loop) return 0;
+      const c = pos(s, t);
+      pushSeg(s, { t0: t, c0: c, rate: s.freq * s.align, loop });
+      post({ op: 'set', id: s.id, at: t, pos: c, freq: s.freq, loop, playing: true });
+      if (!was) { DS.plays++; if (DS.onPlay) DS.onPlay(s); }
+      return 0;
+    }],
+    ['SetCurrentPosition', 1, (s, [c]) => {
+      if (!s.size) return 0;
+      c = Math.min(c >>> 0, s.size - 1); c -= c % s.align;
+      const t = T(), g = segAt(s, t);
+      pushSeg(s, { t0: t, c0: c, rate: g.rate, loop: g.loop }); post({ op: 'set', id: s.id, at: t, pos: c }); return 0;
+    }],
     ['SetFormat', 1, (s, [p]) => { s.wfx = m.u8.slice(p, p + 18); return 0; }],
-    ['SetVolume', 1, (s, [v]) => { s.vol = v; return 0; }], ['SetPan', 1, (s, [v]) => { s.pan = v; return 0; }],
-    ['SetFrequency', 1, (s, [f]) => { if (f) { s.freq = f; s.bps = f * s.align; } return 0; }],
-    ['Stop', 0, s => { s.cursor = pos(s); s.playing = false; return 0; }],
-    ['Unlock', 4, () => 0], ['Restore', 0, () => 0],
+    ['SetVolume', 1, (s, [v]) => {
+      s.vol = Math.max(-10000, Math.min(0, v | 0));
+      if (s.primary) post({ op: 'master', gain: dsGains(s.vol, 0)[0] }); else setGains(s);
+      return 0;
+    }],
+    ['SetPan', 1, (s, [v]) => { s.pan = Math.max(-10000, Math.min(10000, v | 0)); if (!s.primary) setGains(s); return 0; }],
+    ['SetFrequency', 1, (s, [f]) => {
+      if (s.primary) return 0;
+      f = f === 0 ? s.freq0 : Math.max(100, Math.min(200000, f >>> 0));         // 0 = DSBFREQUENCY_ORIGINAL
+      if (f === s.freq) return 0;
+      const t = T(), g = segAt(s, t), c = pos(s, t);
+      s.freq = f;
+      pushSeg(s, { t0: t, c0: c, rate: g.rate ? f * s.align : 0, loop: g.loop }); post({ op: 'set', id: s.id, at: t, pos: c, freq: f }); return 0;
+    }],
+    ['Stop', 0, s => {
+      if (s.primary) return 0;
+      const t = T(); if (!segAt(s, t).rate) return 0;
+      const c = pos(s, t);
+      pushSeg(s, { t0: t, c0: c, rate: 0, loop: false }); post({ op: 'set', id: s.id, at: t, pos: c, playing: false }); return 0;
+    }],
+    ['Unlock', 4, (s, [p1, n1, p2, n2]) => {
+      if (!s.size) return 0;
+      for (const [p, n] of [[p1, n1], [p2, n2]]) {
+        if (!p || !n) continue;
+        const off = p - s.data.mem; if (off < 0 || off >= s.size) continue;
+        const bytes = m.u8.slice(p, p + Math.min(n, s.size - off));
+        post({ op: 'write', id: s.data.id, off, bytes }, [bytes.buffer]);
+      }
+      return 0;
+    }],
+    ['Restore', 0, () => 0],
     ['SetFX', 3, () => 0x80004001], ['AcquireResources', 3, () => 0], ['GetObjectInPath', 4, () => 0x80004001]]);
   const dsCls = new ComClass(m, 'IDirectSound8', [...unk(),
     ['CreateSoundBuffer', 3, (s, [pd, pp]) => {
       const flags = m.r32(pd + 4), size = m.r32(pd + 8), pwfx = m.r32(pd + 16);
-      const wfx = pwfx ? m.u8.slice(pwfx, pwfx + 18) : new Uint8Array(18);
-      const dvw = new DataView(wfx.buffer);
-      const freq = dvw.getUint32(4, true) || 22050, align = dvw.getUint16(12, true) || 4;
-      const st = { flags, size: (flags & 1) ? 0 : size, wfx, freq, align, bps: freq * align, mem: size && !(flags & 1) ? m.heap.alloc(size) : 0, playing: false };
-      m.w32(pp, bufCls.create(st)); W.dsBuffers = (W.dsBuffers || 0) + 1; return 0;
+      if (flags & 1) {   // DSBCAPS_PRIMARYBUFFER: its SetVolume is the master volume
+        const wfx = new Uint8Array(18); new DataView(wfx.buffer).setUint16(0, 1, true);
+        m.w32(pp, newBuffer({ flags, primary: true, size: 0, wfx, freq: 44100, freq0: 44100, align: 4, data: null })); return 0;
+      }
+      if (!pwfx || size < 4) { m.w32(pp, 0); return 0x80070057 | 0; }   // DSERR_INVALIDPARAM
+      const wfx = m.u8.slice(pwfx, pwfx + 18), f = fmt(wfx);
+      if (f.tag !== 1) m.log(`DirectSound CreateSoundBuffer: format tag ${f.tag} (not PCM), played as PCM`);
+      if (flags & 0x10) m.log('DirectSound CreateSoundBuffer: DSBCAPS_CTRL3D requested (played as 2D)');
+      const data = { id: nextId++, mem: m.heap.alloc(size), size, bits: f.bits, ch: f.ch, refs: 1 };
+      post({ op: 'data', id: data.id, size, bits: f.bits, ch: f.ch });
+      m.w32(pp, newBuffer({ flags, size, wfx, freq: f.rate, freq0: f.rate, align: f.align, data }));
+      if (DS.onCreate) DS.onCreate(m.comObjs.get(m.r32(pp)));
+      return 0;
     }],
-    ['GetCaps', 1, (s, [p]) => { const n = m.r32(p); m.bytes(p + 4, Math.max(0, n - 4)).fill(0); m.w32(p + 4, 0xF5F); return 0; }],
-    ['DuplicateSoundBuffer', 2, () => 0x80004001], ['SetCooperativeLevel', 2, () => 0], ['Compact', 0, () => 0],
+    ['GetCaps', 1, (s, [p]) => {   // DSCAPS: software mixing only, like DirectSound on Vista+ (the game then uses 16 voices, 0067b470)
+      const n = m.r32(p); m.bytes(p + 4, Math.max(0, n - 4)).fill(0);
+      m.w32(p + 4, 0xF5F); m.w32(p + 8, 100); m.w32(p + 12, 200000); m.w32(p + 16, 1); return 0;
+    }],
+    ['DuplicateSoundBuffer', 2, (s, [src, pp]) => {
+      const o = m.comObjs.get(src);
+      if (!o || o.primary || !o.data) { m.w32(pp, 0); return 0x88780032 | 0; }
+      o.data.refs++;
+      m.w32(pp, newBuffer({ flags: o.flags, size: o.size, wfx: o.wfx, freq: o.freq0, freq0: o.freq0, align: o.align, data: o.data })); return 0;
+    }],
+    ['SetCooperativeLevel', 2, () => 0], ['Compact', 0, () => 0],
     ['GetSpeakerConfig', 1, (s, [p]) => { m.w32(p, 4); return 0; }], ['SetSpeakerConfig', 1, () => 0], ['Initialize', 1, () => 0],
     ['VerifyCertification', 1, (s, [p]) => { m.w32(p, 0); return 0; }]]);
+  /** Re-send every live buffer (data + state) to the mixer: used when the AudioContext (re)starts on a new clock. */
+  DS.resync = () => {
+    const t = T(), sent = new Set();
+    for (const s of DS.buffers) {
+      if (s.primary) { post({ op: 'master', gain: dsGains(s.vol, 0)[0] }); continue; }
+      if (!sent.has(s.data.id)) {
+        sent.add(s.data.id);
+        post({ op: 'data', id: s.data.id, size: s.size, bits: s.data.bits, ch: s.data.ch });
+        const bytes = m.u8.slice(s.data.mem, s.data.mem + s.size); post({ op: 'write', id: s.data.id, off: 0, bytes }, [bytes.buffer]);
+      }
+      const g = segAt(s, t), [gl, gr] = dsGains(s.vol, s.pan);
+      post({ op: 'voice', id: s.id, data: s.data.id });
+      post({ op: 'set', id: s.id, at: t, pos: pos(s, t), freq: s.freq, loop: g.loop, playing: isPlaying(s, t), gl, gr });
+    }
+  };
+  /** Live state for the page / tests. */
+  DS.status = () => { const t = be.now(); return [...DS.buffers].filter(s => !s.primary).map(s => ({ id: s.id, size: s.size, freq: s.freq, ch: s.data.ch, bits: s.data.bits, vol: s.vol, pan: s.pan, playing: isPlaying(s, t), loop: segAt(s, t).loop, cursor: cur(s, t), name: s.name })); };
   S.set('dsound.dll!#11', { nargs: 3, fn: ([g, pp]) => { m.w32(pp, dsCls.create({})); return 0; } });
 }
 

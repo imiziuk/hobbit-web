@@ -12,6 +12,7 @@ import { VFS } from './host/vfs.mjs';
 import { NodeBackend } from './host/node_fs.mjs';
 import { Win32 } from './host/win32.mjs';
 import { installDirectInput, installDirectSound, installD3D8, nullGL } from './host/dx.mjs';
+import { DsMixer, wavBytes } from './host/dsmix.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.dirname(HERE);
@@ -42,7 +43,12 @@ async function main() {
   const W = new Win32(m, vfs, { onDebug: s => log('[dbg] ' + s.replace(/\s+$/, '')), knownDlls: ['shfolder.dll'] });
   W.fileLog = (p, w, ok) => { files.push(`${ok ? 'ok ' : 'NO '}${w ? 'W' : 'R'} ${p}`); };
   const S = W.table();
-  installDirectInput(m, W, S); installDirectSound(m, W, S);
+  const DSTRACE = +opt('dstrace', 0); let dsn = 0;   // --dstrace N: log the first N DirectSound method calls
+  if (DSTRACE) m.comTrace = (iface, name, a) => { if (iface.startsWith('IDirectSound') && dsn++ < DSTRACE) log(`  [ds] f${W.frames} ${iface}::${name} ${a.slice(1).map(x => hex(x >>> 0)).join(' ')}`); };
+  // --audio-wav out.wav [--audio-seconds N]: mix the DirectSound buffers offline (recomp/host/dsmix.mjs, the same mixer as
+  // the browser's AudioWorklet) on the virtual clock and write what the speakers would have played
+  const audioWav = opt('audio-wav', ''), audio = audioWav ? nodeAudio(m, +opt('audio-seconds', 180)) : null;
+  installDirectInput(m, W, S); installDirectSound(m, W, S, audio && audio.backend);
   const com = await import(pathToFileURL(path.join(ROOT, 'web', 'd3d8', 'com.js')).href);
   await installD3D8(m, W, S, nullGL(640, 480), com);
   const missing = m.bindImports(S);
@@ -114,10 +120,37 @@ async function main() {
   fs.writeFileSync(path.join(OUT, 'files.txt'), files.join('\n') + '\n');
   if (visReset) fs.writeFileSync(path.join(OUT, 'entered_after_reset.txt'), order.filter((a, i) => m.r8(visAt + i)).map(a => a.toString(16).padStart(8, '0') + (visBefore.has(a) ? '' : ' new')).join('\n') + '\n');
   fs.writeFileSync(path.join(OUT, 'entered.txt'), order.filter((a, i) => m.r8(visAt + i)).map(a => a.toString(16).padStart(8, '0')).join('\n') + '\n');
+  if (audio) audio.finish(path.resolve(audioWav), log, W);
   for (const a of (opt('peek', '') || '').split(',').filter(Boolean)) log(`peek ${a}: ` + [...Array(8)].map((_, i) => hex(m.r32(parseInt(a, 16) + 4 * i))).join(' '));
   log(`presents ${W.frames}, functions entered ${summary.funcs_entered}, host calls ${calls.reduce((a, b) => a + b[1], 0)}, wall ${secs.toFixed(1)} s`);
   log('D3D calls: ' + d3d.map(([k, v]) => `${k.replace(/^IDirect3D(Device)?8::/, '')}=${v}`).join(' '));
   process.exit(0);
+}
+
+function nodeAudio(m, maxSeconds) {
+  const sr = 22050, mixer = new DsMixer(sr), t0 = m.clock.now();
+  const cap = Math.round(maxSeconds * sr), L = new Float32Array(cap), R = new Float32Array(cap);
+  const now = () => (m.clock.now() - t0) / 1000;
+  const blocks = [];   // per-second RMS
+  const renderTo = t => {
+    const f = Math.min(cap, Math.floor(t * sr));
+    while (mixer.frame < f) {
+      const n = Math.min(f - mixer.frame, sr - (mixer.frame % sr));
+      const o = mixer.frame; mixer.render(L, R, n, o);
+      if (mixer.frame % sr === 0) { const st = mixer.stats; blocks.push(+Math.sqrt(st.sumsq / Math.max(1, st.n)).toFixed(4)); st.sumsq = 0; st.n = 0; }
+    }
+  };
+  return {
+    mixer,
+    backend: { now, lead: 0, post(c) { renderTo(now()); if (c.at !== undefined) c.at = Math.max(c.at, mixer.frame / sr); mixer.post(c); } },
+    finish(file, log, W) {
+      renderTo(now());
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, wavBytes(L, R, sr, mixer.frame));
+      log(`audio: ${(mixer.frame / sr).toFixed(1)} s mixed -> ${file}; buffers created ${W.ds.created}, plays ${W.ds.plays}, peak ${mixer.stats.peak.toFixed(3)}`);
+      log('audio RMS per second: ' + blocks.join(' '));
+    },
+  };
 }
 
 function stackDump(m, log) {

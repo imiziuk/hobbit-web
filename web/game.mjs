@@ -7,6 +7,7 @@ import { installDirectInput, installDirectSound, installD3D8 } from '../recomp/h
 import * as com from './d3d8/com.js';
 import { installMultiplayer } from '../recomp/host/mp.mjs';
 import { installTouch, mergePads } from './touch.mjs';
+import { createAudio } from './audio.mjs';
 
 const q = new URLSearchParams(location.search);
 // Where the game data and the relay are. ?data= / ?mp= always win. Otherwise:
@@ -79,8 +80,24 @@ function setupPhoneUI() {
   if (!document.fullscreenEnabled && !document.webkitFullscreenEnabled) fsBtn.hidden = true;   // e.g. iPhone Safari
 }
 
+// Sound: volume slider + mute (remembered); the AudioContext starts on the first click / key / touch (autoplay policy)
+const audio = createAudio({ log: s => log(s) });
+function setupAudioUI() {
+  const ls = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } };
+  const vol = $('vol'), on = $('sndOn');
+  const v0 = ls('hobbit.vol'), m0 = ls('hobbit.mute');
+  if (v0 !== null && !isNaN(+v0)) vol.value = Math.max(0, Math.min(100, +v0));
+  on.checked = m0 !== '1';
+  audio.setVolume(vol.value / 100); audio.setMute(!on.checked);
+  vol.addEventListener('input', () => { audio.setVolume(vol.value / 100); ls('hobbit.vol', vol.value); });
+  on.addEventListener('change', () => { audio.setMute(!on.checked); ls('hobbit.mute', on.checked ? '0' : '1'); });
+  for (const el of [vol, on]) el.addEventListener('keydown', e => e.stopPropagation());   // arrow keys on the slider are not game input
+  window.hobbit.audio = audio;
+}
+
 async function main() {
   setupPhoneUI();
+  const audioReady = audio.init().then(setupAudioUI).catch(e => log('audio: ' + e.message));
   if (typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function') {
     log('JSPI (WebAssembly.Suspending / promising) is not available in this browser. Chrome 137+ has it by default; ' +
       'older Chrome: enable chrome://flags/#enable-experimental-webassembly-jspi. Not falling back to Asyncify.');
@@ -120,7 +137,8 @@ async function main() {
   window.hobbit.http = httpBe;
   const W = new Win32(m, vfs, { onDebug: s => log('[dbg] ' + s.replace(/\s+$/, '')), knownDlls: ['shfolder.dll'] });
   const S = W.table();
-  installDirectInput(m, W, S); installDirectSound(m, W, S);
+  installDirectInput(m, W, S); installDirectSound(m, W, S, audio.backend); audio.attach(W.ds);
+  await audioReady;
   await installD3D8(m, W, S, gl, com);
   const missing = m.bindImports(S);
   log(`imports bound ${m.pe.imports.length - missing.length}/${m.pe.imports.length}`);
@@ -140,7 +158,8 @@ async function main() {
     for (const [a, name] of MS) if (!reached.has(a) && m.r8(visAt + ordinal.get(a))) { reached.add(a); log(`== reached ${name} at Present ${n}`); }
     fpsN++; const now = performance.now(); if (now - fpsT > 1000) { fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; }
     if (n % 10 === 0) statEl.textContent = `Present ${n} | ${fps.toFixed(1)} fps | FE state ${m.r32(0x762b58)} | ` +
-      `http ${httpBe.fetches} req ${(httpBe.bytes / 1e6).toFixed(1)} MB` + (httpBe.storeHits ? ` (+${httpBe.storeHits} cached blocks)` : '') + ` | heap ${(m.heap.inuse / 1e6).toFixed(0)} MB`;
+      `http ${httpBe.fetches} req ${(httpBe.bytes / 1e6).toFixed(1)} MB` + (httpBe.storeHits ? ` (+${httpBe.storeHits} cached blocks)` : '') + ` | heap ${(m.heap.inuse / 1e6).toFixed(0)} MB` +
+      ` | sound ${audio.state === 'running' ? `${audio.stats.voices} voices ${audio.stats.rms > 1e-5 ? (20 * Math.log10(audio.stats.rms)).toFixed(0) + ' dB' : 'silent'}` : audio.ctx ? 'click to start' : 'off'}`;
     window.hobbit.presents = n; window.hobbit.feState = m.r32(0x762b58);
     if (snaps.includes(n)) {   // ?snap=N,M: keep a copy of those frames under the canvas (proof screenshots)
       const img = new Image(); img.src = canvas.toDataURL('image/png'); img.title = 'Present ' + n; img.width = 320;

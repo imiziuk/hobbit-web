@@ -110,3 +110,26 @@ That needs multi-entry functions or a "resume at address" path in the translator
 3. New Game -> LoadLevel (not tried yet); C++ exception continuations if a level load throws.
 4. HLE of D3DX texture loading if the recompiled path is too slow (9,600 CheckDeviceFormat calls at boot).
 5. Settings files are not persisted in the browser (MemBackend); Node writes them to `recomp/out/appdata`.
+
+## Input: mouse and gamepad (Oct 14)
+- **Mouse in menus:** the game reads the cursor with `GetCursorPos` from the pump (00660420 -> 006603b0 stores client
+  coordinates at 0x7effc8/cc), and button state from WM_LBUTTON/RBUTTON/MBUTTON in its WndProc (0065d860 -> 0x7effd4/d8/dc).
+  Other screens read the DirectInput mouse buttons. The shim used to return a fixed (320, 240). Now:
+  - `W.mouseEvent` posts WM_MOUSEMOVE (coalesced) and button messages in window client coordinates, and sets the cursor.
+  - Button-up messages are held for 3 pumps, and DirectInput buttons are latched for 3 polls, so a quick click is not lost between frames.
+- **Gamepad:** a virtual DirectInput joystick is always enumerated (GAMECTRL), so a pad can be plugged in at any time.
+  - The game sets `c_dfDIJoystick2` (0x6f9d04, 272 bytes) and sets DIPROP_RANGE -1000..1000 per axis in its EnumObjects
+    callback (00670dc0). It polls GetDeviceState(0x110) in 0066fc30.
+  - Our product GUID matches none of the pads it knows (00670860), so it uses its generic profile (type 0).
+  - Default bindings, from its Controls screen (0-based button numbers): Move = X/Y, Camera = Z/RZ, Toggle View 0, Ring 1,
+    Jump 2, Attack 3, Crouch 4, Use 5 (also menu accept), Target 7, D-pad = Walking-stick / Stones / Sword.
+  - `dx.mjs padState` maps the W3C standard gamepad onto those indices per mode. The page decides the mode:
+    - `menu` = level loop off (0x760354 == 0), logic paused (0x7600f4), or the pause menu open (0x76321c, a field of the
+      pause object found by diffing globals);
+    - `cutscene` = g_pBilbo (0x75ba3c) + 0x44c == 1 (set by 00422980, "CINEMA: Bilbo Input set FALSE");
+    - otherwise `game`.
+  - Start = Esc in game, and Enter in menus and cutscenes (Enter skips movies; it is Use in gameplay, so it is not sent there).
+    B = Esc in menus.
+- Tested in the browser pane: real mouse hover and click through Options → Controls → Gamepad, and a simulated
+  standard gamepad through menu → New Game → skip movie and cutscene → run → pause menu (navigate, open Audio, back)
+  → resume. Not yet tested with a physical controller.

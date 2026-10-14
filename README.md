@@ -30,8 +30,28 @@ WebAssembly (~120 MB, into `tools/`). Then it translates the exe to C and compil
 | `127.0.0.1:5190` | this folder (the page + wasm) |
 | `127.0.0.1:5191` | your game folder, **read-only**, with HTTP Range reads (nothing is copied or written) |
 
-Controls are the game's defaults: arrow keys move, Space jumps, Enter selects in menus. Click the canvas first to give
-it focus. Options: `--rebuild`, `--port N`, `--no-browser`.
+Click the canvas first to give it keyboard focus. Options: `--rebuild`, `--port N`, `--no-browser`.
+
+### Controls
+
+**Keyboard and mouse:** the game's PC defaults. Arrows or W/S move, A/D strafe, Space jumps, Enter is Use and also skips
+movies and cutscenes, and Esc pauses. The mouse works in every menu: hover, then click.
+
+**Gamepad:** any controller Chrome recognises (Xbox, PlayStation, Switch Pro, ...). Plug it in and press a button. It reaches the
+game as a DirectInput joystick, so the game's own *Options → Controls → Gamepad* screen can rebind it.
+
+| Button | In game | In menus |
+|---|---|---|
+| Left stick | Move | Navigate |
+| Right stick | Camera | |
+| A | Jump | Accept |
+| X | Attack | |
+| B | Crouch | Back |
+| Y | Use | Accept |
+| LB / RB | Equip Ring / Target | |
+| Back (View) | Toggle view | |
+| Start | Pause | Skip movie / cutscene |
+| D-pad | Walking-stick (left), Stones (up), Sword (right) | Navigate |
 
 Verified game version: Meridian.exe md5 `3e351efeea5c7e1eb55095d8f5b12fab` (retail PC). Other versions will warn,
 because the translation tables in `auto/` describe this exact binary.
@@ -73,3 +93,4 @@ and `HOBBIT_EXE`, or use the default sibling paths.
 - Resuming C++ exceptions.
 - Saving settings in the browser.
 - Testing beyond Dream World.
+- Gamepad: tested with a simulated pad (menus, New Game, skipping, moving, pause menu); not yet with a physical controller.

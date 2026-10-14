@@ -24,7 +24,9 @@ export class Win32 {
     this.debugLog = [];             // OutputDebugString lines
     this.unhandledFilter = 0;
     this.lastFrame = 0; this.frames = 0; this.presentedSincePump = false; this.lastPumpYield = 0;
-    this.input = { keys: new Uint8Array(256), mouse: { dx: 0, dy: 0, dz: 0, b: [0, 0, 0, 0] } };
+    this.input = { keys: new Uint8Array(256), mouse: { dx: 0, dy: 0, dz: 0, b: [0, 0, 0, 0] },
+      cursor: { x: 320, y: 240 },     // main-window client coordinates (GetCursorPos, MSG.pt)
+      readPad: null };                // () => {axes:[lx,ly,rx,ry,lt,rt], buttons:[bool]} | null (Gamepad API, set by the page)
     this.cmdline = opts.cmdline || 'C:\\HOBBIT\\Meridian.exe';
     this.onMessageBox = opts.onMessageBox || null;
   }
@@ -100,8 +102,21 @@ export class Win32 {
     const proc = this.wndproc(hwnd); if (!proc) return 0;
     return this.m.callGuest(proc, [hwnd, msg, w >>> 0, l >>> 0]);
   }
-  writeMsg(p, q) { const m = this.m; m.w32(p, q.hwnd); m.w32(p + 4, q.msg); m.w32(p + 8, q.w); m.w32(p + 12, q.l); m.w32(p + 16, m.clock.now() >>> 0); m.w32(p + 20, 320); m.w32(p + 24, 240); }
+  writeMsg(p, q) { const m = this.m; m.w32(p, q.hwnd); m.w32(p + 4, q.msg); m.w32(p + 8, q.w); m.w32(p + 12, q.l); m.w32(p + 16, m.clock.now() >>> 0); m.w32(p + 20, this.input.cursor.x); m.w32(p + 24, this.input.cursor.y); }
   postMessage(hwnd, msg, w = 0, l = 0) { this.msgq.push({ hwnd, msg, w: w >>> 0, l: l >>> 0 }); }
+  /** Mouse input from the page, in main-window client coordinates. The game reads the menu cursor with GetCursorPos
+   *  (00660420 -> 006603b0, called by the pump) and button state from WM_xBUTTONDOWN/UP in its WndProc (0065d860:
+   *  0x7effd4/d8/dc). WM_MOUSEMOVE is coalesced like Windows does. */
+  mouseEvent(msg, x, y, flags) {
+    this.input.cursor.x = x | 0; this.input.cursor.y = y | 0;
+    const hwnd = this.mainHwnd || 0, l = ((y & 0xffff) << 16) | (x & 0xffff);
+    const last = this.msgq[this.msgq.length - 1];
+    if (msg === 0x200 && last && last.msg === 0x200) { last.l = l >>> 0; last.w = flags >>> 0; return; }
+    this.postMessage(hwnd, msg, flags, l);
+    // button-up: hold it back 3 pumps (= 3 game frames) so the menus see the button down. They poll the state that the
+    // WndProc sets, so a down + up dispatched in the same pump was invisible and a quick click did nothing.
+    if (msg === 0x202 || msg === 0x205 || msg === 0x208) this.msgq[this.msgq.length - 1].hold = 3;
+  }
 
   /* ---------------------------------------------------------------- the shim table */
   table() {
@@ -429,7 +444,7 @@ export class Win32 {
     U('ClientToScreen', 2, ok); U('MapWindowPoints', 4, zero);
     U('AdjustWindowRect', 3, ok); U('AdjustWindowRectEx', 4, ok);
     U('GetMonitorInfoA', 2, ([h, p]) => { [0, 0, 1920, 1080, 0, 0, 1920, 1040].forEach((v, i) => m.w32(p + 4 + 4 * i, v)); m.w32(p + 36, 1); return 1; });
-    U('GetCursorPos', 1, ([p]) => { m.w32(p, 320); m.w32(p + 4, 240); return 1; });
+    U('GetCursorPos', 1, ([p]) => { m.w32(p, W.input.cursor.x); m.w32(p + 4, W.input.cursor.y); return 1; });
     U('SetCursor', 1, zero); U('LoadCursorA', 2, () => 0x20001); U('LoadIconA', 2, () => 0x20003);
     U('ClipCursor', 1, ok); U('GetClipCursor', 1, ([p]) => { [0, 0, 1920, 1080].forEach((v, i) => m.w32(p + 4 * i, v)); return 1; });
     U('SystemParametersInfoA', 4, ([a, ui, pv]) => { if (pv && (a === 0x3A || a === 0x70)) { if (a === 0x70) m.w32(pv, 10); } return 1; });
@@ -445,7 +460,8 @@ export class Win32 {
     U('DispatchMessageA', 1, ([p]) => W.sendMessage(m.r32(p), m.r32(p + 4), m.r32(p + 8), m.r32(p + 12)));
     U('PeekMessageA', 5, ([p, hwnd, lo, hi, rm]) => {
       W.pumpHook?.();
-      if (W.msgq.length) { W.writeMsg(p, W.msgq[0]); if (rm & 1) W.msgq.shift(); return 1; }
+      if (W.msgq.length && W.msgq[0].hold) W.msgq[0].hold--;                 // held message: try again next pump (frame)
+      else if (W.msgq.length) { W.writeMsg(p, W.msgq[0]); if (rm & 1) W.msgq.shift(); return 1; }
       // pump with no Present since the last pump: give the browser (or the virtual clock) one frame tick
       const yieldNow = !W.presentedSincePump && m.cur === m.mainThread && !m.nested;
       W.presentedSincePump = false;

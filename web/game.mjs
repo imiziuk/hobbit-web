@@ -83,9 +83,56 @@ async function main() {
   const keys = W.input.keys;
   window.addEventListener('keydown', e => { const k = DIK[e.code]; if (k) { keys[k] = 0x80; e.preventDefault(); } });
   window.addEventListener('keyup', e => { const k = DIK[e.code]; if (k) { keys[k] = 0; e.preventDefault(); } });
-  canvas.addEventListener('mousemove', e => { W.input.mouse.dx += e.movementX; W.input.mouse.dy += e.movementY; });
-  canvas.addEventListener('mousedown', e => { W.input.mouse.b[e.button === 2 ? 1 : e.button === 1 ? 2 : 0] = 1; });
-  window.addEventListener('mouseup', e => { W.input.mouse.b[e.button === 2 ? 1 : e.button === 1 ? 2 : 0] = 0; });
+  // mouse: DirectInput deltas (camera) + window messages and GetCursorPos (the menus read the cursor from the window)
+  const gameXY = e => {
+    const r = canvas.getBoundingClientRect(), win = W.windows.get(W.mainHwnd) || {};
+    const gw = win.w || canvas.width, gh = win.h || canvas.height;
+    return [Math.max(0, Math.min(gw - 1, Math.round((e.clientX - r.left) * gw / r.width))),
+            Math.max(0, Math.min(gh - 1, Math.round((e.clientY - r.top) * gh / r.height)))];
+  };
+  const BTN = [[0x201, 0x202], [0x207, 0x208], [0x204, 0x205]];   // left, middle, right: WM_xBUTTONDOWN / UP
+  const mk = () => (W.input.mouse.b[0] ? 1 : 0) | (W.input.mouse.b[1] ? 2 : 0) | (W.input.mouse.b[2] ? 0x10 : 0);
+  canvas.addEventListener('mousemove', e => {
+    W.input.mouse.dx += e.movementX; W.input.mouse.dy += e.movementY;
+    const [x, y] = gameXY(e); W.mouseEvent(0x200, x, y, mk());
+  });
+  canvas.addEventListener('mousedown', e => {
+    canvas.focus(); const bi = e.button === 2 ? 1 : e.button === 1 ? 2 : 0;
+    W.input.mouse.b[bi] = 1; (W.input.mouse.latch ||= [0, 0, 0, 0])[bi] = 3;
+    const [x, y] = gameXY(e), b = BTN[e.button]; if (b) W.mouseEvent(b[0], x, y, mk());
+  });
+  window.addEventListener('mouseup', e => {
+    W.input.mouse.b[e.button === 2 ? 1 : e.button === 1 ? 2 : 0] = 0;
+    const [x, y] = gameXY(e), b = BTN[e.button]; if (b) W.mouseEvent(b[1], x, y, mk());
+  });
+  // gamepad: Gamepad API, read whenever the game polls its DirectInput joystick (recomp/host/dx.mjs padState)
+  W.input.readPad = () => {
+    const g = [...(navigator.getGamepads ? navigator.getGamepads() : [])].find(p => p && p.connected);
+    if (!g) return null;
+    const val = i => (g.buttons[i] ? g.buttons[i].value : 0);
+    return { axes: [g.axes[0] || 0, g.axes[1] || 0, g.axes[2] || 0, g.axes[3] || 0, val(6), val(7)],
+             buttons: g.buttons.map(b => b.pressed || b.value > 0.5) };
+  };
+  // menus vs gameplay: gameplay = Game_LevelLoop running (0x760354), logic not paused (0x7600f4) and the in-game pause
+  // menu closed (0x76321c: a field of the pause object, 0 -> 1 while it is open; found by diffing the globals)
+  // cutscene = Bilbo's input disabled by a cinema (g_pBilbo 0x75ba3c, +0x44c set by 00422980 "CINEMA: Bilbo Input set FALSE")
+  W.input.padMode = () => {
+    if (!m.r32(0x760354) || m.r32(0x7600f4) || m.r32(0x76321c)) return 'menu';
+    const b = m.r32(0x75ba3c);
+    return b && m.r32(b + 0x44c) === 1 ? 'cutscene' : 'game';
+  };
+  // pad buttons that act as keys (held while the button is held). Gameplay: Start = Esc (pause). Cutscenes: Start = Enter
+  // ("Press Enter to skip"). Menus and movies: Start = Enter (skips movies), B = Esc (back). Enter is not sent in gameplay
+  // because it is bound to Use there. A timer, not rAF, so it keeps working in a background tab.
+  const padHeld = { 1: false, 28: false };
+  setInterval(() => {
+    const g = W.input.readPad(), mode = W.input.padMode(), menu = mode === 'menu', want = { 1: false, 28: false };
+    if (g) { if (g.buttons[9]) want[mode === 'game' ? 1 : 28] = true; if (menu && g.buttons[1]) want[1] = true; }
+    for (const k of [1, 28]) if (want[k] !== padHeld[k]) { padHeld[k] = want[k]; keys[k] = want[k] ? 0x80 : 0; }
+  }, 16);
+  const padEl = $('pad');
+  const padName = e => { if (padEl) padEl.textContent = e.type === 'gamepadconnected' ? 'Gamepad: ' + e.gamepad.id.replace(/\s*\(.*$/, '') : ''; log((e.type === 'gamepadconnected' ? 'gamepad connected: ' : 'gamepad disconnected: ') + e.gamepad.id); };
+  window.addEventListener('gamepadconnected', padName); window.addEventListener('gamepaddisconnected', padName);
   canvas.addEventListener('wheel', e => { W.input.mouse.dz -= Math.sign(e.deltaY) * 120; e.preventDefault(); }, { passive: false });
   canvas.addEventListener('contextmenu', e => e.preventDefault());
   window.hobbit.press = (code, ms = 150) => { const k = DIK[code]; keys[k] = 0x80; setTimeout(() => { keys[k] = 0; }, ms); };

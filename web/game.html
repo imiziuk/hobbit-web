@@ -21,10 +21,11 @@
   <h1>The Hobbit (2003), recompiled x86 → WebAssembly</h1>
   <canvas id="screen" width="640" height="480" tabindex="0"></canvas>
   <div id="stat">idle</div>
+  <div id="pad" style="color:var(--muted);font-size:12px">No gamepad yet: plug one in and press any button.</div>
   <div id="snaps"></div>
   <pre id="log"></pre>
   <p class="note">Runs recomp/out/hobbit_flat.wasm from the real entry point with JSPI green threads and the web/d3d8 WebGL2 device.
-    Game files are read with HTTP Range requests from recomp/serve_game.py (127.0.0.1:5191, read-only). Keyboard goes to DirectInput.</p>
+    Game files are read with HTTP Range requests from recomp/serve_game.py (127.0.0.1:5191, read-only). Keyboard, mouse and gamepad (Gamepad API, as a DirectInput joystick) go to the game.</p>
 </main>
 <script type="module" src="game.mjs"></script>
 </body>

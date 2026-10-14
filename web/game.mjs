@@ -281,7 +281,7 @@ function setupMultiplayer(m, W) {
   roomEl.value = q.get('room') || store('room') || 'main';
   const render = mp => {
     const me = mp.local ? levelName(mp.local.l) : 'menu';
-    statusEl.textContent = `${mp.status}` + (mp.id ? ` | you: #${mp.id} slot ${mp.slot} (${me})` : '') +
+    statusEl.textContent = `${mp.status}` + (mp.room ? ` | room "${mp.room}"` : '') + (mp.id ? ` | you: #${mp.id} slot ${mp.slot} (${me})` : '') +
       ` | fake Bilbos found ${mp.npc.size}/8 | sent ${mp.stats.sent} recv ${mp.stats.recv}`;
     listEl.replaceChildren(...[...mp.players.values()].map(p => {
       const li = document.createElement('li');
@@ -297,7 +297,10 @@ function setupMultiplayer(m, W) {
   const go = () => { store('name', nameEl.value); store('url', urlEl.value); store('room', roomEl.value); mp.connect(wsUrl(urlEl.value.trim()), nameEl.value.trim(), roomEl.value.trim() || 'main'); };
   $('mpConnect').onclick = go;
   $('mpDisconnect').onclick = () => mp.disconnect();
-  for (const el of [nameEl, urlEl, roomEl]) el.addEventListener('keydown', e => e.stopPropagation());   // typing is not game input
+  for (const el of [nameEl, urlEl, roomEl]) el.addEventListener('keydown', e => {   // typing is not game input
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); go(); }            // Enter in Name/Server/Room = (re)connect
+  });
   if (q.get('mp') || q.get('name') || q.get('room')) go();   // a link with mp=, name= or room= joins automatically
 }
 

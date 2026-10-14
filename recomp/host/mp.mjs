@@ -168,18 +168,35 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
     }
     onChange(mp);
   }
-  mp.connect = (url, name, room = 'main') => {
-    mp.disconnect();
-    mp.url = url; mp.name = name || 'Hobbit'; mp.room = room; mp.status = 'connecting'; onChange(mp);
+  // Reconnect automatically when the connection drops (relay restart, Wi-Fi blip, a proxy closing an idle socket);
+  // only Disconnect stops it. Backoff 1, 2, 4 ... 10 s.
+  let retryTimer = null, retries = 0;
+  const scheduleRetry = () => {
+    if (!mp.want || retryTimer) return;
+    const wait = Math.min(10000, 1000 * 2 ** retries++);
+    mp.status = `reconnecting in ${Math.round(wait / 1000)} s`; onChange(mp);
+    retryTimer = setTimeout(() => { retryTimer = null; if (mp.want) open(); }, wait);
+  };
+  const open = () => {
+    const { url, room } = mp.want;
+    mp.status = 'connecting'; onChange(mp);
     let ws;
-    try { ws = new WebSocket(url); } catch (e) { mp.status = 'error: ' + e.message; onChange(mp); return; }
+    try { ws = new WebSocket(url); } catch (e) { mp.status = 'error: ' + e.message; onChange(mp); scheduleRetry(); return; }
     mp.ws = ws;
-    ws.onopen = () => ws.send(JSON.stringify({ t: 'hello', name: mp.name, room }));
+    ws.onopen = () => { retries = 0; ws.send(JSON.stringify({ t: 'hello', name: mp.name, room })); };
     ws.onmessage = e => { try { onMessage(JSON.parse(e.data)); } catch (err) { log('[mp] bad message: ' + err.message); } };
-    ws.onclose = () => { if (mp.ws === ws) { mp.ws = null; mp.status = 'offline'; mp.players.clear(); onChange(mp); log('[mp] disconnected'); } };
+    ws.onclose = () => { if (mp.ws === ws) { mp.ws = null; mp.id = 0; mp.status = 'offline'; mp.players.clear(); onChange(mp); log('[mp] disconnected'); scheduleRetry(); } };
     ws.onerror = () => { if (mp.ws === ws) { mp.status = 'error (is the relay running?)'; onChange(mp); } };
   };
-  mp.disconnect = () => { if (mp.ws) { const ws = mp.ws; mp.ws = null; ws.close(); } mp.status = 'offline'; mp.players.clear(); onChange(mp); };
+  mp.connect = (url, name, room = 'main') => {
+    mp.disconnect();
+    mp.url = url; mp.name = name || 'Hobbit'; mp.room = room; mp.want = { url, room }; retries = 0;
+    open();
+  };
+  mp.disconnect = () => {
+    mp.want = null; if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (mp.ws) { const ws = mp.ws; mp.ws = null; ws.close(); } mp.id = 0; mp.status = 'offline'; mp.players.clear(); onChange(mp);
+  };
   mp.tick = () => { try { tick(); } catch (e) { mp.stats.errors++; if (mp.stats.errors < 5) log('[mp] tick error: ' + e.message); } };
   mp.findObjects = findObjects; mp.readLocal = () => inLevel() ? readLocal() : null; mp.scan = scan;
 

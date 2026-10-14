@@ -16,6 +16,7 @@ SKIP = re.compile(r"(^|/)(shadow_fail[^/]*|\.git)(/|$)|\.log$|\.dll\.", re.I)
 class Handler(BaseHTTPRequestHandler):
     root = DEFAULT_ROOT
     manifest = None
+    overlay = {}          # {relative path (lower case): virtual file with .size and .read(lo, n)} from mp_assets.py
 
     def log_message(self, fmt, *args):
         pass
@@ -45,7 +46,8 @@ class Handler(BaseHTTPRequestHandler):
                     for f in fs:
                         rel = os.path.relpath(os.path.join(d, f), self.root).replace("\\", "/")
                         if not SKIP.search(rel):
-                            files.append([rel, os.path.getsize(os.path.join(d, f))])
+                            v = Handler.overlay.get(rel.lower())
+                            files.append([rel, v.size if v else os.path.getsize(os.path.join(d, f))])
                 Handler.manifest = json.dumps({"files": files}).encode()
             body = Handler.manifest
             self.send_response(200)
@@ -56,11 +58,12 @@ class Handler(BaseHTTPRequestHandler):
             if not head:
                 self.wfile.write(body)
             return
+        virt = Handler.overlay.get(path.lstrip("/").lower())
         full = os.path.normpath(os.path.join(self.root, path.lstrip("/")))
-        if not full.startswith(self.root + os.sep) or not os.path.isfile(full):
+        if not virt and (not full.startswith(self.root + os.sep) or not os.path.isfile(full)):
             self.send_error(404)
             return
-        size = os.path.getsize(full)
+        size = virt.size if virt else os.path.getsize(full)
         lo, hi = 0, size - 1
         m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
         partial = bool(m)
@@ -87,6 +90,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if head:
             return
+        if virt:
+            self.wfile.write(virt.read(lo, hi - lo + 1))
+            return
         with open(full, "rb") as f:
             f.seek(lo)
             left = hi - lo + 1
@@ -98,12 +104,27 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(chunk)
 
 
+def enable_mp(root, cache=None):
+    """Add the multiplayer overlay (virtual patched DFS archives, see mp_assets.py). Never writes to the game folder."""
+    sys.path.insert(0, HERE)
+    import mp_assets
+    syn = mp_assets.fetch_release(cache or os.path.join(os.path.dirname(HERE), "cache", "synchrony"))
+    overlay, report = mp_assets.build_overlay(root, syn)
+    Handler.overlay = {k.lower(): v for k, v in overlay.items()}
+    Handler.manifest = None
+    print("multiplayer assets: %d virtual archives" % (len(overlay) // 2), flush=True)
+    return report
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=5191)
     ap.add_argument("--root", default=DEFAULT_ROOT)
+    ap.add_argument("--mp", action="store_true", help="serve virtual archives with the multiplayer (Synchrony) assets")
     a = ap.parse_args()
     Handler.root = os.path.normpath(os.path.abspath(a.root))
+    if a.mp:
+        enable_mp(Handler.root)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)
     print("serving %s read-only on http://127.0.0.1:%d" % (Handler.root, a.port), flush=True)
     srv.serve_forever()

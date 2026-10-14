@@ -69,6 +69,19 @@ game as a DirectInput joystick, so the game's own *Options → Controls → Game
 Verified game version: Meridian.exe md5 `3e351efeea5c7e1eb55095d8f5b12fab` (retail PC). Other versions will warn,
 because the translation tables in `auto/` describe this exact binary.
 
+## Multiplayer (up to 8 players)
+
+```
+python start.py --mp            # relay on port+2 (5192), this machine only
+python start.py --mp --lan      # reachable from your LAN / Tailscale; prints the URLs
+```
+Each player runs their own copy (`start.py --mp`) and types the host's `IP:5192` into the **Multiplayer** panel under
+the game (or opens `game.html?mp=IP:5192&name=YourName`). Start or load any level; players on the same level see each
+other. Remote players are the fake-Bilbo NPCs of **The Hobbit Synchrony v3**
+(https://github.com/hobbit-kingdom/hobbit-synchrony-v3, BSD-3): its data files are downloaded once from its release
+into `cache/` and served as virtual archives; nothing is written to the game folder. Details and what is not synced
+yet: `docs/MULTIPLAYER.md`.
+
 ## How it works
 
 ```

@@ -14,6 +14,12 @@
   #log { background: var(--panel); height: 260px; overflow: auto; margin: 0; padding: 8px; font: 11px/1.35 ui-monospace, monospace; white-space: pre-wrap; }
   #snaps img { margin: 4px 4px 0 0; }
   p.note { color: var(--muted); font-size: 12px; }
+  #mp { background: var(--panel); padding: 8px 10px; margin: 8px 0; max-width: 620px; display: grid; gap: 6px; }
+  #mp .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  #mp input { background: #222; color: var(--fg); border: 1px solid #333; padding: 3px 6px; font: inherit; min-width: 0; }
+  #mp button { background: #2a2a2a; color: var(--fg); border: 1px solid #444; padding: 3px 10px; font: inherit; cursor: pointer; }
+  #mpStatus { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; }
+  #mpPlayers { margin: 0; padding-left: 18px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -22,6 +28,15 @@
   <canvas id="screen" width="640" height="480" tabindex="0"></canvas>
   <div id="stat">idle</div>
   <div id="pad" style="color:var(--muted);font-size:12px">No gamepad yet: plug one in and press any button.</div>
+  <section id="mp" aria-label="Multiplayer">
+    <div class="row"><strong>Multiplayer</strong>
+      <label>Name <input id="mpName" size="10" maxlength="24" value="Hobbit"></label>
+      <label>Server <input id="mpUrl" size="22" placeholder="host:port"></label>
+      <label>Room <input id="mpRoom" size="6" maxlength="32" value="main"></label>
+      <button id="mpConnect">Connect</button><button id="mpDisconnect">Disconnect</button></div>
+    <div id="mpStatus">offline</div>
+    <ul id="mpPlayers"></ul>
+  </section>
   <div id="snaps"></div>
   <pre id="log"></pre>
   <p class="note">Runs recomp/out/hobbit_flat.wasm from the real entry point with JSPI green threads and the web/d3d8 WebGL2 device.

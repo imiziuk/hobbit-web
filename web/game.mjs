@@ -5,6 +5,7 @@ import { VFS, HttpBackend, MemBackend } from '../recomp/host/vfs.mjs';
 import { Win32 } from '../recomp/host/win32.mjs';
 import { installDirectInput, installDirectSound, installD3D8 } from '../recomp/host/dx.mjs';
 import * as com from './d3d8/com.js';
+import { installMultiplayer } from '../recomp/host/mp.mjs';
 
 const q = new URLSearchParams(location.search);
 const DATA = q.get('data') || 'http://127.0.0.1:5191';
@@ -79,6 +80,8 @@ async function main() {
     }
   };
 
+  setupMultiplayer(m, W);
+
   // input -> DirectInput state
   const keys = W.input.keys;
   window.addEventListener('keydown', e => { const k = DIK[e.code]; if (k) { keys[k] = 0x80; e.preventDefault(); } });
@@ -149,4 +152,38 @@ async function main() {
     statEl.textContent += ' | STOPPED';
   }
 }
+// multiplayer panel (recomp/host/mp.mjs; relay = recomp/mp_relay.py, default port = this page's port + 2)
+// URL: ?mp=host:port&name=Bilbo&room=main connects automatically.
+function setupMultiplayer(m, W) {
+  const LEVELS = ['Dream World', 'An Unexpected Party', 'Roast Mutton', 'Troll-hole', 'Over Hill and Under Hill', 'Riddles in the Dark',
+    'Flies and Spiders', 'Barrels out of Bond', 'A Warm Welcome', 'Inside Information', 'The Gathering of the Clouds', 'The Clouds Burst'];
+  const levelName = l => l === undefined || l < 0 ? 'menu' : (LEVELS[l] || 'level ' + l);
+  const store = (k, v) => { try { if (v === undefined) return localStorage.getItem('hobbit.mp.' + k); localStorage.setItem('hobbit.mp.' + k, v); } catch { return null; } };
+  const nameEl = $('mpName'), urlEl = $('mpUrl'), roomEl = $('mpRoom'), statusEl = $('mpStatus'), listEl = $('mpPlayers');
+  const defHost = `${location.hostname || '127.0.0.1'}:${(+location.port || (location.protocol === 'https:' ? 443 : 80)) + 2}`;
+  nameEl.value = q.get('name') || store('name') || 'Hobbit';
+  urlEl.value = q.get('mp') || store('url') || defHost;
+  roomEl.value = q.get('room') || store('room') || 'main';
+  const render = mp => {
+    const me = mp.local ? levelName(mp.local.l) : 'menu';
+    statusEl.textContent = `${mp.status}` + (mp.id ? ` | you: #${mp.id} slot ${mp.slot} (${me})` : '') +
+      ` | fake Bilbos found ${mp.npc.size}/8 | sent ${mp.stats.sent} recv ${mp.stats.recv}`;
+    listEl.replaceChildren(...[...mp.players.values()].map(p => {
+      const li = document.createElement('li');
+      const same = mp.local && p.level === mp.local.l;
+      li.textContent = `${p.name} (slot ${p.slot}) - ${levelName(p.level)}` + (same && p.have ? ' - here' : '');
+      return li;
+    }));
+  };
+  const mp = installMultiplayer({ m, W, log, onChange: render });
+  window.hobbit.mp = mp;
+  setInterval(() => render(mp), 1000);
+  const wsUrl = v => /^wss?:\/\//.test(v) ? v : (location.protocol === 'https:' ? 'wss://' : 'ws://') + v;
+  const go = () => { store('name', nameEl.value); store('url', urlEl.value); store('room', roomEl.value); mp.connect(wsUrl(urlEl.value.trim()), nameEl.value.trim(), roomEl.value.trim() || 'main'); };
+  $('mpConnect').onclick = go;
+  $('mpDisconnect').onclick = () => mp.disconnect();
+  for (const el of [nameEl, urlEl, roomEl]) el.addEventListener('keydown', e => e.stopPropagation());   // typing is not game input
+  if (q.get('mp')) go();
+}
+
 main().catch(e => { log('fatal: ' + e.message + '\n' + e.stack); });

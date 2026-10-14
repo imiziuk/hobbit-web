@@ -13,3 +13,4 @@ d3drec/node_modules/
 *.bik
 *.exe
 *.dll
+cache/

@@ -5,6 +5,8 @@
     python start.py --find                            forget the saved folder and search again
     python start.py --rebuild                         force re-translation + rebuild
     python start.py --no-browser --port 5190
+    python start.py --mp                              multiplayer (docs/MULTIPLAYER.md): relay on port+2
+    python start.py --mp --lan                        ... reachable from the LAN / Tailscale
 
 What it does, in order:
  1. finds your game folder (find_game: --game, config.json, HOBBIT_GAME_DIR, a game/ folder next to this repo,
@@ -247,16 +249,50 @@ class StaticHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
-def serve(game, port, open_browser):
+def local_ips():
+    """LAN / Tailscale IPv4 addresses of this machine (best effort, stdlib only)."""
+    import socket
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith("127."))
+
+
+def serve(game, port, open_browser, mp=False, lan=False):
     sys.path.insert(0, os.path.join(HERE, "recomp"))
     import serve_game
     serve_game.Handler.root = game
-    data = http.server.ThreadingHTTPServer(("127.0.0.1", port + 1), serve_game.Handler)
-    web = http.server.ThreadingHTTPServer(("127.0.0.1", port), StaticHandler)
+    host = "0.0.0.0" if lan else "127.0.0.1"
+    if mp:
+        import mp_relay
+        for line in serve_game.enable_mp(game, os.path.join(HERE, "cache", "synchrony")):
+            say("  " + line)
+        relay = mp_relay.make_server(host, port + 2, log=lambda s: say(s))
+        threading.Thread(target=relay.serve_forever, daemon=True).start()
+    data = http.server.ThreadingHTTPServer((host, port + 1), serve_game.Handler)
+    web = http.server.ThreadingHTTPServer((host, port), StaticHandler)
     threading.Thread(target=data.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/web/game.html" + ("" if port == 5190 else f"?data=http://127.0.0.1:{port + 1}")
-    say(f"game data (read-only): http://127.0.0.1:{port + 1}  <- {game}")
+    say(f"game data (read-only): http://{host}:{port + 1}  <- {game}")
+    if mp:
+        say(f"multiplayer relay: ws://{host}:{port + 2}  (assets: Synchrony v1.0 fake-Bilbo layer, served as virtual archives)")
     say(f"PLAY: {url}   (Chrome/Edge 137+; Ctrl+C here to stop)")
+    if lan:
+        for ip in local_ips():
+            say(f"  from another device: http://{ip}:{port}/web/game.html?data=http://{ip}:{port + 1}" + (f"&mp={ip}:{port + 2}" if mp else ""))
+        if mp:
+            say(f"  friends with their own copy: run start.py --mp and put <this IP>:{port + 2} in the Server field")
+        say("  --lan: anyone who can reach this machine can open the page and read the game files; use it on trusted networks")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
@@ -272,6 +308,9 @@ def main():
     ap.add_argument("--port", type=int, default=5190)
     ap.add_argument("--rebuild", action="store_true")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--mp", action="store_true", help="multiplayer: fake-Bilbo assets from the Synchrony release (downloaded "
+                    "once into cache/) + WebSocket relay on port+2")
+    ap.add_argument("--lan", action="store_true", help="listen on all interfaces (LAN / Tailscale) instead of 127.0.0.1")
     a = ap.parse_args()
     cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
     game = find_game(a.game, cfg.get("game_dir"), a.find)
@@ -282,7 +321,7 @@ def main():
     if not shutil.which("node"):
         say("note: Node.js is optional (only for the headless runner recomp/boot_node.mjs)")
     build(exe, a.rebuild)
-    serve(game, a.port, not a.no_browser)
+    serve(game, a.port, not a.no_browser, mp=a.mp, lan=a.lan)
 
 
 if __name__ == "__main__":

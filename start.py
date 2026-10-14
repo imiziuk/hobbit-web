@@ -252,6 +252,9 @@ def ensure_wasm_gz(path=None):
         return
     if os.path.exists(gz) and os.path.getmtime(gz) >= os.path.getmtime(path):
         return
+    if not os.access(os.path.dirname(path), os.W_OK):               # read-only deploy: ship the .gz prebuilt
+        say(f"note: {os.path.basename(gz)} missing or stale and the build folder is read-only; serving uncompressed")
+        return
     say(f"compressing {os.path.basename(path)} for download (gzip, once per build)")
     with open(path, "rb") as f:
         data = gzip.compress(f.read(), compresslevel=9, mtime=0)
@@ -486,8 +489,12 @@ def main():
     game = find_game(a.game, cfg.get("game_dir"), a.find)
     exe = check_game(game)
     if game != cfg.get("game_dir") and not DEV_TREE:
-        json.dump({"game_dir": game}, open(CONFIG, "w"), indent=2)
-        say("remembered in config.json (change it with --game or --find)")
+        try:
+            with open(CONFIG, "w") as f:
+                json.dump({"game_dir": game}, f, indent=2)
+            say("remembered in config.json (change it with --game or --find)")
+        except OSError:                                              # read-only container (docker-compose.server.yml)
+            pass
     if not shutil.which("node"):
         say("note: Node.js is optional (only for the headless runner recomp/boot_node.mjs)")
     build(exe, a.rebuild)

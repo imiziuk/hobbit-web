@@ -1,0 +1,73 @@
+# Hardened always-on deployment (e.g. a home server). Prebuilt: run start.py / docker compose on a PC first, then copy
+# recomp/out (hobbit_flat.wasm + .wasm.gz + funcs.txt) and cache/synchrony here. See docs/DEPLOY_SERVER.md.
+#
+#   docker compose -f docker-compose.server.yml up -d --build                       (Tailscale only)
+#   docker compose -f docker-compose.server.yml --profile cloudflare up -d --build  (+ Cloudflare tunnel)
+#
+# Isolation: the game container sits on an INTERNAL network: no internet, no LAN, no route to this host's other
+# services. Only the gateways (tailscale, cloudflared) can reach it, and only its web port. It runs as an unprivileged
+# user with a read-only filesystem, no Linux capabilities, no privilege escalation and resource limits; its only mounts
+# are the game folder and the prebuilt build, both read-only. No secrets live in it.
+x-hardened: &hardened
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+
+services:
+  hobbit:
+    <<: *hardened
+    build: .
+    image: hobbit-web
+    container_name: hobbit-web
+    user: "10001:10001"
+    read_only: true
+    tmpfs: ["/tmp:size=64m"]
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 2g
+    cpus: 2.0
+    environment:
+      - HOBBIT_GAME_DIR=/game
+    networks: [internal]
+    volumes:
+      - "${GAME_DIR:-./game}:/game:ro"
+      - ./recomp/out:/app/recomp/out:ro
+      - ./cache:/app/cache:ro
+
+  tailscale:
+    <<: *hardened
+    image: tailscale/tailscale:stable
+    container_name: hobbit-tailscale
+    hostname: hobbit-web
+    cap_drop: [ALL]
+    mem_limit: 256m
+    environment:
+      - TS_HOSTNAME=hobbit-web
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=true
+      - TS_AUTHKEY=${TS_AUTHKEY:-}
+      - TS_SERVE_CONFIG=/config/serve.json
+    volumes:
+      - ./ts-state:/var/lib/tailscale
+      - ./tailscale/serve.server.json:/config/serve.json:ro
+    networks: [internal, egress]
+    depends_on: [hobbit]
+
+  cloudflared:
+    <<: *hardened
+    image: cloudflare/cloudflared:latest
+    container_name: hobbit-cloudflared
+    profiles: [cloudflare]
+    command: tunnel --no-autoupdate run
+    read_only: true
+    cap_drop: [ALL]
+    mem_limit: 256m
+    environment:
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:?set CF_TUNNEL_TOKEN in .env}
+    networks: [internal, egress]
+    depends_on: [hobbit]
+
+networks:
+  internal:
+    internal: true        # no gateway: containers only on this network cannot reach anything outside it
+  egress: {}              # internet for the two gateways only

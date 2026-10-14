@@ -15,3 +15,5 @@ d3drec/node_modules/
 *.dll
 cache/
 .env
+ts-state/
+game/

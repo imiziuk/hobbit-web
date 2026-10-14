@@ -82,6 +82,44 @@ other. Remote players are the fake-Bilbo NPCs of **The Hobbit Synchrony v3**
 into `cache/` and served as virtual archives; nothing is written to the game folder. Details and what is not synced
 yet: `docs/MULTIPLAYER.md`.
 
+## Run it in Docker
+
+```
+cp .env.example .env          # then set GAME_DIR to your game folder (the one with Meridian.exe)
+docker compose up -d --build
+```
+Open **http://127.0.0.1:5190/web/game.html**. The first start translates and compiles the game, about 4 minutes
+(`docker logs -f hobbit-web`). The build lands in `recomp/out/` and is reused after that; if you already built it with
+`start.py`, it starts instantly.
+
+What the container exposes:
+
+| Port | What | Reachable from |
+|---|---|---|
+| 5190 | the game page | this machine only |
+| 5191 | your game files, read-only | this machine only (never shared) |
+| 5192 | multiplayer relay | the network (LAN / Tailscale); set `RELAY_BIND` in `.env` to narrow it |
+
+The game folder is mounted read-only, and the image contains no game files.
+
+## Play with a friend over the internet (Tailscale)
+
+Every player runs their **own** copy, with their own game files, through Docker or `start.py`. Only the relay of one
+player, the host, is shared. Steps:
+
+1. **Host:** run the container (above), or `python start.py --mp --lan`.
+2. **Network:** both install [Tailscale](https://tailscale.com). The host shares their machine with the friend:
+   Tailscale admin console → Machines → *your PC* → **Share** → send the invite link. The friend accepts it. The host's
+   Tailscale IP (100.x.y.z) is shown in the Tailscale app. On the same LAN you can use the LAN IP instead.
+3. **Friend:** clone this repo, put their own game folder in `.env`, and run `docker compose up -d --build`.
+4. **Both** open `http://127.0.0.1:5190/web/game.html?mp=<host Tailscale IP>:5192&name=<your name>&room=main`.
+   The host can use `mp=127.0.0.1:5192`. You can also type the address in the Multiplayer panel and press Connect.
+5. Start a New Game in the same level. The other player appears as a second Bilbo, and the panel lists everyone with
+   their level ("here" = same level as you).
+
+The relay has no password, so share it only through Tailscale or a trusted LAN, not as an open internet port. Both
+copies should be the verified retail version: `start.py` warns if `Meridian.exe` differs.
+
 ## How it works
 
 ```

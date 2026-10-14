@@ -287,6 +287,11 @@ def serve(game, port, open_browser, mp=False, lan=False):
     if mp:
         say(f"multiplayer relay: ws://{host}:{port + 2}  (assets: Synchrony v1.0 fake-Bilbo layer, served as virtual archives)")
     say(f"PLAY: {url}   (Chrome/Edge 137+; Ctrl+C here to stop)")
+    if lan and os.environ.get("HOBBIT_IN_DOCKER"):
+        say(f"in Docker: open http://127.0.0.1:{port}/web/game.html on this machine")
+        if mp:
+            say(f"  multiplayer: friends put <this machine's LAN or Tailscale IP>:{port + 2} in the Server field (or ?mp=IP:{port + 2})")
+        lan = False
     if lan:
         for ip in local_ips():
             say(f"  from another device: http://{ip}:{port}/web/game.html?data=http://{ip}:{port + 1}" + (f"&mp={ip}:{port + 2}" if mp else ""))

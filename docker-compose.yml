@@ -1,0 +1,22 @@
+# docker compose up --build        (first start translates + compiles the game: ~4 minutes, then cached)
+# Set GAME_DIR in .env (see .env.example) to the folder that holds Meridian.exe and the .DFS archives.
+services:
+  hobbit:
+    build: .
+    image: hobbit-web
+    container_name: hobbit-web
+    restart: unless-stopped
+    volumes:
+      - "${GAME_DIR:?set GAME_DIR in .env to your game folder}:/game:ro"   # read-only: nothing is ever written there
+      - ./recomp/out:/app/recomp/out          # the translated game build (reused if you already built it)
+      - tools:/app/tools
+      - venv:/app/.venv
+      - cache:/app/cache
+    ports:
+      - "127.0.0.1:5190:5190"      # the game page: this machine only
+      - "127.0.0.1:5191:5191"      # your game files: this machine only (never share them)
+      - "${RELAY_BIND:-0.0.0.0}:5192:5192"   # multiplayer relay: reachable by friends (LAN / Tailscale)
+volumes:
+  tools:
+  venv:
+  cache:

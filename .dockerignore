@@ -1,0 +1,16 @@
+.git
+.venv
+tools
+cache
+config.json
+recomp/out
+__pycache__
+d3drec/build
+d3drec/node_modules
+.env
+*.DFS
+*.000
+*.001
+*.bik
+*.exe
+*.dll

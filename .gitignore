@@ -14,3 +14,4 @@ d3drec/node_modules/
 *.exe
 *.dll
 cache/
+.env

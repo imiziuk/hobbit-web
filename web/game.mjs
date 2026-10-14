@@ -189,7 +189,7 @@ function setupMultiplayer(m, W) {
   $('mpConnect').onclick = go;
   $('mpDisconnect').onclick = () => mp.disconnect();
   for (const el of [nameEl, urlEl, roomEl]) el.addEventListener('keydown', e => e.stopPropagation());   // typing is not game input
-  if (q.get('mp')) go();
+  if (q.get('mp') || q.get('name') || q.get('room')) go();   // a link with mp=, name= or room= joins automatically
 }
 
 main().catch(e => { log('fatal: ' + e.message + '\n' + e.stack); });

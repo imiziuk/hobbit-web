@@ -25,7 +25,14 @@ python start.py --mp --lan           # listen on all interfaces; prints LAN / Ta
   printed URL and stream them. Use it only on a trusted network (home LAN / your Tailscale tailnet). On Windows the
   first `--lan` run may show a firewall prompt for Python.
 
-Dev setup in IRA (`.claude/launch.json`): `hobbit-web` (5190) + `hobbit-game-data-mp` (5193, `serve_game.py --mp`) +
+- **Single-origin server** (`start.py --single`, the Docker default, required behind Cloudflare Access): the relay is
+  the WebSocket path `/relay` on the page's own port (`ws://host:5190/relay`, or `wss://<name>/relay` over HTTPS);
+  the panel's default server is that URL (the page reads `/__mode`). A remembered server that was just the old
+  port+2 / :10000 default is replaced by `/relay` automatically. In Docker the old relay port 5192 (Tailscale 10000)
+  stays on and shares the same rooms.
+
+Dev setup in IRA (`.claude/launch.json`): `hobbit-single` (5390: `webrepo/start.py --single --mp`, page
+`http://127.0.0.1:5390/web/game.html`), or the 3-port one: `hobbit-web` (5190) + `hobbit-game-data-mp` (5193, `serve_game.py --mp`) +
 `hobbit-mp-relay` (5192), page `http://localhost:5190/web/game.html?data=http://127.0.0.1:5193&mp=localhost:5192`.
 
 ## 1. Assets: virtual patched archives (`recomp/mp_assets.py`)
@@ -56,7 +63,8 @@ each DFS read), so a loose overlay directory would probably work too; the virtua
 ## 2. Netcode (`recomp/mp_relay.py`, stdlib only)
 
 A WebSocket relay (RFC 6455 handshake, masking, fragmentation, ping/pong, close) on port+2, started by
-`start.py --mp` or standalone (`python recomp/mp_relay.py --port 5192 [--host 0.0.0.0]`). Rooms of up to 8; each client
+`start.py --mp` or standalone (`python recomp/mp_relay.py --port 5192 [--host 0.0.0.0]`); with `start.py --single
+--mp` the same code runs as an upgrade on the HTTP server's `/relay` path (`mp_relay.serve_upgrade`). Rooms of up to 8; each client
 gets the lowest free slot 0..7 = fake Bilbo GUID `0D8AD910_E885100(2+slot)` (Synchrony `GuidManager::assignGuid`, with
 `FAKE_BILBO_GUID.txt` order). The relay does not interpret state: it stamps the sender id and forwards. Sockets idle
 for 20 s are dropped (clients send at least once per second).

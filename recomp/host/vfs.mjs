@@ -71,17 +71,26 @@ export class MemBackend {
 }
 
 /* ------------------------------------------------------------------ HTTP Range backend (browser, read-only game folder) */
+// Reads are 64 KB blocks: memory cache (~128 MB) -> persistent Cache API store (browser only, secure contexts:
+// https or localhost) -> one ranged request per run of missing blocks. The store is keyed by file + version + size
+// (from the manifest), so a changed game folder or the multiplayer overlay never serves stale blocks, and a second
+// session reads almost nothing from the network. Node has no Cache API: it is skipped there.
+export const DATA_CACHE = 'hobbit-data-v1';
 export class HttpBackend {
-  /** base: URL of the read-only game server; manifest: {files: [[relPath, size], ...]} (dirs are implied) */
-  constructor(base, manifest) {
+  /** base: URL of the read-only game server; manifest: {files: [[relPath, size, version?], ...]} (dirs are implied)
+   *  opts.persist: false disables the Cache API store */
+  constructor(base, manifest, opts = {}) {
     this.base = base.replace(/\/$/, '');
     this.files = new Map(); this.dirs = new Map([['', '']]);
-    for (const [p, size] of manifest.files) {
-      this.files.set(p.toLowerCase(), { path: p, size });
+    for (const [p, size, ver] of manifest.files) {
+      this.files.set(p.toLowerCase(), { path: p, size, ver: ver === undefined ? '' : String(ver),
+        url: this.base + '/' + p.split('/').map(encodeURIComponent).join('/') });
       const parts = p.split('/');
       for (let i = 1; i < parts.length; i++) this.dirs.set(parts.slice(0, i).join('/').toLowerCase(), parts.slice(0, i).join('/'));
     }
-    this.cache = new Map(); this.BLOCK = 1 << 16; this.fetches = 0; this.bytes = 0;
+    this.cache = new Map(); this.BLOCK = 1 << 16; this.fetches = 0; this.bytes = 0; this.stored = 0; this.storeHits = 0;
+    const can = opts.persist !== false && typeof caches !== 'undefined' && (typeof isSecureContext === 'undefined' || isSecureContext);
+    this.store = can ? caches.open(DATA_CACHE).catch(() => null) : null;
   }
   stat(rel) {
     const k = rel.toLowerCase();
@@ -101,7 +110,14 @@ export class HttpBackend {
     const be = this;
     return { size: () => f.size, read: (pos, n) => be.read(f, pos, n), close() {} };
   }
-  /** returns Uint8Array synchronously when every block is cached, else a Promise */
+  /** versioned URL: the server marks ?v= responses immutable (HTTP cache) */
+  furl(f) { return f.ver ? `${f.url}?v=${encodeURIComponent(f.ver)}-${f.size}` : f.url; }
+  skey(f, b) { return `${f.url}?v=${encodeURIComponent(f.ver)}-${f.size}&b=${b}`; }
+  remember(f, b, blk) {
+    this.cache.set(f.path + '#' + b, blk);
+    if (this.cache.size > 8192) { const ks = [...this.cache.keys()].slice(0, 2048); ks.forEach(k => this.cache.delete(k)); }   // ~128 MB cap
+  }
+  /** returns Uint8Array synchronously when every block is in memory, else a Promise */
   read(f, pos, n) {
     n = Math.max(0, Math.min(n, f.size - pos));
     const B = this.BLOCK, b0 = Math.floor(pos / B), b1 = Math.floor((pos + n - 1) / B);
@@ -116,16 +132,41 @@ export class HttpBackend {
       return out;
     };
     if (!missing.length) return assemble();
-    // one ranged request covering the missing blocks (bigger reads stay one request)
-    const lo = missing[0] * B, hi = Math.min(f.size, (missing[missing.length - 1] + 1) * B) - 1;
-    this.fetches++;
-    return fetch(this.base + '/' + f.path.split('/').map(encodeURIComponent).join('/'), { headers: { Range: `bytes=${lo}-${hi}` } })
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status} for ${f.path}`); return r.arrayBuffer(); })
-      .then(buf => {
-        const d = new Uint8Array(buf); this.bytes += d.length;
-        for (let b = missing[0]; b <= missing[missing.length - 1]; b++) this.cache.set(f.path + '#' + b, d.subarray(b * B - lo, Math.min(d.length, (b + 1) * B - lo)));
-        if (this.cache.size > 8192) { const ks = [...this.cache.keys()].slice(0, 2048); ks.forEach(k => this.cache.delete(k)); }   // ~128 MB cap
-        return assemble();
-      });
+    const pending = new Map();   // the blocks of this read stay referenced even if the memory cache evicts them
+    const assemble2 = () => { for (const [b, blk] of pending) if (!this.cache.has(f.path + '#' + b)) this.cache.set(f.path + '#' + b, blk); return assemble(); };
+    return this.fromStore(f, missing, pending).then(rest => this.fromNet(f, rest, pending)).then(assemble2);
+  }
+  async fromStore(f, blocks, pending) {
+    const store = this.store && await this.store;
+    if (!store) return blocks;
+    const got = await Promise.all(blocks.map(b => store.match(this.skey(f, b)).then(r => r ? r.arrayBuffer() : null).catch(() => null)));
+    const rest = [];
+    blocks.forEach((b, i) => {
+      if (got[i]) { const blk = new Uint8Array(got[i]); pending.set(b, blk); this.remember(f, b, blk); this.storeHits++; }
+      else rest.push(b);
+    });
+    return rest;
+  }
+  async fromNet(f, blocks, pending) {
+    if (!blocks.length) return;
+    const B = this.BLOCK, runs = [];   // one ranged request per run of consecutive missing blocks
+    for (const b of blocks) { const r = runs[runs.length - 1]; if (r && r[1] === b - 1) r[1] = b; else runs.push([b, b]); }
+    const store = this.store && await this.store;
+    await Promise.all(runs.map(async ([first, last]) => {
+      const lo = first * B, hi = Math.min(f.size, (last + 1) * B) - 1;
+      this.fetches++;
+      const r = await fetch(this.furl(f), { headers: { Range: `bytes=${lo}-${hi}` } });
+      if (!r.ok) throw new Error(`HTTP ${r.status} for ${f.path}`);
+      const d = new Uint8Array(await r.arrayBuffer()); this.bytes += d.length;
+      if (r.status === 200 && d.length !== hi - lo + 1) throw new Error(`no Range support for ${f.path}`);
+      for (let b = first; b <= last; b++) {
+        const blk = d.slice(b * B - lo, Math.min(d.length, (b + 1) * B - lo));
+        pending.set(b, blk); this.remember(f, b, blk);
+        if (store) { this.stored++; store.put(this.skey(f, b), new Response(blk, { headers: { 'Content-Type': 'application/octet-stream' } })).catch(() => {}); }
+      }
+    }));
   }
 }
+
+/** Delete the persistent game-data cache (browser). */
+export async function clearDataCache() { return typeof caches !== 'undefined' ? caches.delete(DATA_CACHE) : false; }

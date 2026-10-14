@@ -7,6 +7,8 @@
     python start.py --no-browser --port 5190
     python start.py --mp                              multiplayer (docs/MULTIPLAYER.md): relay on port+2
     python start.py --mp --lan                        ... reachable from the LAN / Tailscale
+    python start.py --single                          ONE port: page at /, game data at /data/, relay at /relay
+                                                      (default in Docker; needed behind Cloudflare Tunnel + Access)
 
 What it does, in order:
  1. finds your game folder (find_game: --game, config.json, HOBBIT_GAME_DIR, a game/ folder next to this repo,
@@ -14,14 +16,19 @@ What it does, in order:
  2. creates .venv with capstone + pefile (translator dependencies),
  3. downloads wasi-sdk 34 (clang for WebAssembly) into tools/ if WASI_SDK is not set,
  4. translates Meridian.exe to C and compiles recomp/out/hobbit_flat.wasm (first run: a few minutes),
- 5. serves this folder on 127.0.0.1:<port> and your game folder READ-ONLY on 127.0.0.1:<port+1>,
+ 5. serves this folder on 127.0.0.1:<port> and your game folder READ-ONLY on 127.0.0.1:<port+1> (relay: port+2),
+    or with --single everything on <port> (/data/ = game folder, /relay = WebSocket relay),
  6. opens http://127.0.0.1:<port>/web/game.html (Chrome/Edge 137+ needed: WebAssembly JSPI).
 Nothing is ever written to the game folder. Game files are never copied into this repo.
 """
-import argparse, hashlib, http.server, json, os, platform, shutil, subprocess, sys, tarfile, threading, urllib.request, webbrowser
+import argparse, email.utils, gzip, hashlib, http.server, json, os, platform, shutil, subprocess, sys, tarfile
+import threading, urllib.parse, urllib.request, webbrowser
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(HERE, "config.json")
+DEV_TREE = not os.path.isdir(os.path.join(HERE, "recomp"))      # run from Hobbit-Decomp/webrepo/ in the source tree:
+if DEV_TREE:                                                     # serve the parent, never save config.json
+    HERE = os.path.dirname(HERE)
 KNOWN_MD5 = {"3e351efeea5c7e1eb55095d8f5b12fab": "retail PC v1.0 (the version this port is verified on)"}
 WASI_VER = "34"
 OUT = os.path.join(HERE, "recomp", "out")
@@ -234,9 +241,34 @@ def build(exe, rebuild):
     subprocess.check_call([sys.executable, os.path.join(HERE, "recomp", "build.py"), "--flat"], cwd=HERE, env=env)
 
 
+GZIP_TYPES = (".wasm", ".mjs", ".js", ".json", ".txt", ".html", ".css", ".svg", ".tsv", ".md")
+
+
+def ensure_wasm_gz(path=None):
+    """Precompress hobbit_flat.wasm -> .wasm.gz (34.7 MB -> ~6.4 MB) if missing or older than the wasm."""
+    path = path or WASM
+    gz = path + ".gz"
+    if not os.path.exists(path):
+        return
+    if os.path.exists(gz) and os.path.getmtime(gz) >= os.path.getmtime(path):
+        return
+    say(f"compressing {os.path.basename(path)} for download (gzip, once per build)")
+    with open(path, "rb") as f:
+        data = gzip.compress(f.read(), compresslevel=9, mtime=0)
+    with open(gz + ".part", "wb") as f:
+        f.write(data)
+    os.replace(gz + ".part", gz)
+    say(f"  {os.path.getsize(path) / 1e6:.1f} MB -> {len(data) / 1e6:.1f} MB")
+
+
 class StaticHandler(http.server.SimpleHTTPRequestHandler):
+    """This repo, read-only. Text and wasm go out gzip-compressed when the browser accepts it (the wasm from the
+    precompressed .wasm.gz next to it); every file has an ETag + Last-Modified and `Cache-Control: no-cache`, so a
+    reload costs one 304 per file instead of the download."""
     extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
                       ".mjs": "text/javascript", ".js": "text/javascript", ".wasm": "application/wasm"}
+    gz_cache = {}                  # path -> (mtime_ns, size, gzip bytes) for small text files
+    gz_lock = threading.Lock()
 
     def __init__(self, *a, **k):
         super().__init__(*a, directory=HERE, **k)
@@ -244,9 +276,112 @@ class StaticHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-cache")
-        super().end_headers()
+    def do_GET(self):
+        self.static(head=False)
+
+    def do_HEAD(self):
+        self.static(head=True)
+
+    def gz_body(self, full, st):
+        """(gzip bytes, None) or (None, path of a precompressed .gz) or (None, None) = send it uncompressed."""
+        if full.endswith(".wasm"):
+            gz = full + ".gz"
+            return (None, gz) if os.path.exists(gz) and os.path.getmtime(gz) >= st.st_mtime else (None, None)
+        if st.st_size > (8 << 20):
+            return None, None
+        with self.gz_lock:
+            hit = self.gz_cache.get(full)
+        if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            return hit[2], None
+        with open(full, "rb") as f:
+            data = gzip.compress(f.read(), compresslevel=6, mtime=0)
+        with self.gz_lock:
+            self.gz_cache[full] = (st.st_mtime_ns, st.st_size, data)
+        return data, None
+
+    def static(self, head):
+        full = self.translate_path(self.path)
+        if not os.path.isfile(full):
+            return super().do_HEAD() if head else super().do_GET()      # directory listing / index.html / 404
+        st = os.stat(full)
+        ext = os.path.splitext(full)[1].lower()
+        body, gz_file = None, None
+        if ext in GZIP_TYPES and st.st_size > 1024 and "gzip" in self.headers.get("Accept-Encoding", ""):
+            body, gz_file = self.gz_body(full, st)
+        use_gz = body is not None or gz_file is not None
+        etag = '"%x-%x%s"' % (st.st_size, st.st_mtime_ns, "-gz" if use_gz else "")
+        common = [("ETag", etag), ("Cache-Control", "no-cache"), ("Vary", "Accept-Encoding"),
+                  ("Last-Modified", email.utils.formatdate(st.st_mtime, usegmt=True))]
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            for k, v in common:
+                self.send_header(k, v)
+            self.end_headers()
+            return
+        length = len(body) if body is not None else os.path.getsize(gz_file) if gz_file else st.st_size
+        self.send_response(200)
+        self.send_header("Content-Type", self.guess_type(full))
+        self.send_header("Content-Length", str(length))
+        if use_gz:
+            self.send_header("Content-Encoding", "gzip")
+        for k, v in common:
+            self.send_header(k, v)
+        self.end_headers()
+        if head:
+            return
+        if body is not None:
+            self.wfile.write(body)
+            return
+        with open(gz_file or full, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 1 << 20)
+
+
+class SiteHandler(StaticHandler):
+    """Single-origin mode (--single): one port for everything, so one login (Cloudflare Access) covers it all.
+        /__mode        {"single": true, "data": "data", "relay": "relay" or null}   (web/game.mjs reads it)
+        /data/...      the game folder, read-only (recomp/serve_game.py: Range, manifest, multiplayer overlay)
+        /relay         the multiplayer WebSocket relay (recomp/mp_relay.py), with --mp
+        anything else  this repo (StaticHandler)"""
+    relay = None
+    protocol_version = "HTTP/1.1"          # keep-alive: the game makes many small Range requests
+
+    def cors(self):
+        pass                               # same origin: no CORS headers needed
+
+    def route(self, head):
+        import serve_game, mp_relay
+        path = urllib.parse.unquote(urllib.parse.urlparse(self.path).path)
+        if path == "/__mode":
+            body = json.dumps({"single": True, "data": "data", "relay": "relay" if self.relay else None}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            return
+        if path == "/data" or path.startswith("/data/"):
+            serve_game.serve_path(self, path[5:] or "/", head)
+            return
+        if path == "/relay":
+            if self.relay and not head and mp_relay.serve_upgrade(self, self.relay):
+                return
+            body = b"Hobbit Web multiplayer relay (WebSocket)" + (b"" if self.relay else b": off (start with --mp)") + b"\n"
+            self.send_response(200 if self.relay else 404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            return
+        self.static(head)
+
+    def do_GET(self):
+        self.route(head=False)
+
+    def do_HEAD(self):
+        self.route(head=True)
 
 
 def local_ips():
@@ -268,34 +403,57 @@ def local_ips():
     return sorted(ip for ip in ips if not ip.startswith("127."))
 
 
-def serve(game, port, open_browser, mp=False, lan=False):
+def serve(game, port, open_browser, mp=False, lan=False, single=False, legacy_ports=False):
     sys.path.insert(0, os.path.join(HERE, "recomp"))
-    import serve_game
-    serve_game.Handler.root = game
+    import serve_game, mp_relay
+    serve_game.Handler.root = os.path.normpath(os.path.abspath(game))
     host = "0.0.0.0" if lan else "127.0.0.1"
+    ensure_wasm_gz()
+    relay = None
     if mp:
-        import mp_relay
         for line in serve_game.enable_mp(game, os.path.join(HERE, "cache", "synchrony")):
             say("  " + line)
-        relay = mp_relay.make_server(host, port + 2, log=lambda s: say(s))
-        threading.Thread(target=relay.serve_forever, daemon=True).start()
-    data = http.server.ThreadingHTTPServer((host, port + 1), serve_game.Handler)
-    web = http.server.ThreadingHTTPServer((host, port), StaticHandler)
-    threading.Thread(target=data.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{port}/web/game.html" + ("" if port == 5190 else f"?data=http://127.0.0.1:{port + 1}")
-    say(f"game data (read-only): http://{host}:{port + 1}  <- {game}")
-    if mp:
-        say(f"multiplayer relay: ws://{host}:{port + 2}  (assets: Synchrony v1.0 fake-Bilbo layer, served as virtual archives)")
+        relay = mp_relay.Relay(log=lambda s: say(s))
+    servers = []
+    if single:
+        SiteHandler.relay = relay
+        web = http.server.ThreadingHTTPServer((host, port), SiteHandler)
+    else:
+        web = http.server.ThreadingHTTPServer((host, port), StaticHandler)
+    if not single or legacy_ports:          # separate data + relay ports (3-port layout; Tailscale serve 8443 / 10000)
+        servers.append(http.server.ThreadingHTTPServer((host, port + 1), serve_game.Handler))
+        if mp:
+            servers.append(mp_relay.make_server(host, port + 2, relay=relay))   # same rooms as /relay
+    for srv in servers:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{port}/web/game.html"
+    if not single and port != 5190:
+        url += f"?data=http://127.0.0.1:{port + 1}"
+    if single:
+        say(f"single-origin server http://{host}:{port}: page /, game data /data/ (read-only <- {game})"
+            + (", relay /relay" if mp else ""))
+        if legacy_ports:
+            say(f"  also on the old ports: data {port + 1}" + (f", relay {port + 2}" if mp else ""))
+    else:
+        say(f"game data (read-only): http://{host}:{port + 1}  <- {game}")
+        if mp:
+            say(f"multiplayer relay: ws://{host}:{port + 2}  (assets: Synchrony v1.0 fake-Bilbo layer, served as virtual archives)")
     say(f"PLAY: {url}   (Chrome/Edge 137+; Ctrl+C here to stop)")
     if lan and os.environ.get("HOBBIT_IN_DOCKER"):
         say(f"in Docker: open http://127.0.0.1:{port}/web/game.html on this machine")
         say("  friends (Tailscale node 'hobbit-web', see docker-compose.yml): https://hobbit-web.<your-tailnet>.ts.net/web/game.html")
+        if single:
+            say(f"  Cloudflare Tunnel (docker compose --profile cloudflare up -d): public hostname service = http://127.0.0.1:{port}")
         lan = False
     if lan:
         for ip in local_ips():
-            say(f"  from another device: http://{ip}:{port}/web/game.html?data=http://{ip}:{port + 1}" + (f"&mp={ip}:{port + 2}" if mp else ""))
+            if single:
+                say(f"  from another device: http://{ip}:{port}/web/game.html")
+            else:
+                say(f"  from another device: http://{ip}:{port}/web/game.html?data=http://{ip}:{port + 1}" + (f"&mp={ip}:{port + 2}" if mp else ""))
         if mp:
-            say(f"  friends with their own copy: run start.py --mp and put <this IP>:{port + 2} in the Server field")
+            say("  friends with their own copy: run start.py --mp and put "
+                + (f"<this IP>:{port}/relay" if single else f"<this IP>:{port + 2}") + " in the Server field")
         say("  --lan: anyone who can reach this machine can open the page and read the game files; use it on trusted networks")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
@@ -315,17 +473,25 @@ def main():
     ap.add_argument("--mp", action="store_true", help="multiplayer: fake-Bilbo assets from the Synchrony release (downloaded "
                     "once into cache/) + WebSocket relay on port+2")
     ap.add_argument("--lan", action="store_true", help="listen on all interfaces (LAN / Tailscale) instead of 127.0.0.1")
+    ap.add_argument("--single", action="store_true", default=None, help="one port: page /, game data /data/, relay /relay "
+                    "(default in Docker; what Cloudflare Tunnel + Access needs)")
+    ap.add_argument("--multi-port", dest="single", action="store_false", help="the 3-port layout: page, data port+1, relay port+2")
+    ap.add_argument("--legacy-ports", action="store_true", default=None, help="with --single: also serve the data on port+1 "
+                    "and the relay on port+2 (default in Docker, for the Tailscale serve ports 8443 / 10000)")
     a = ap.parse_args()
+    docker = bool(os.environ.get("HOBBIT_IN_DOCKER"))
+    single = docker if a.single is None else a.single
+    legacy = single and (docker if a.legacy_ports is None else a.legacy_ports)
     cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
     game = find_game(a.game, cfg.get("game_dir"), a.find)
     exe = check_game(game)
-    if game != cfg.get("game_dir"):
+    if game != cfg.get("game_dir") and not DEV_TREE:
         json.dump({"game_dir": game}, open(CONFIG, "w"), indent=2)
         say("remembered in config.json (change it with --game or --find)")
     if not shutil.which("node"):
         say("note: Node.js is optional (only for the headless runner recomp/boot_node.mjs)")
     build(exe, a.rebuild)
-    serve(game, a.port, not a.no_browser, mp=a.mp, lan=a.lan)
+    serve(game, a.port, not a.no_browser, mp=a.mp, lan=a.lan, single=single, legacy_ports=legacy)
 
 
 if __name__ == "__main__":

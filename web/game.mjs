@@ -9,12 +9,24 @@ import { installMultiplayer } from '../recomp/host/mp.mjs';
 import { installTouch, mergePads } from './touch.mjs';
 
 const q = new URLSearchParams(location.search);
-// game data server: ?data=..., else the host this page was opened from, on the next port (on this machine that is
-// 127.0.0.1:5191 as before)
-// Over HTTPS (Tailscale serve in docker-compose.yml) the ports are 443 page / 8443 data / 10000 relay.
+// Where the game data and the relay are. ?data= / ?mp= always win. Otherwise:
+// - single-origin server (start.py --single, the Docker default; needed behind Cloudflare Access): <repo>/__mode answers,
+//   data = <repo>/data, relay = ws(s)://<repo>/relay, all on the page's own origin;
+// - the 3-port layout: data on the page's port + 1 (127.0.0.1:5191), relay on port + 2;
+//   over HTTPS (older Tailscale serve setup) 443 page / 8443 data / 10000 relay.
 const HTTPS = location.protocol === 'https:';
-const DATA = q.get('data') || (HTTPS ? `https://${location.hostname}:8443`
-  : `${location.protocol}//${location.hostname || '127.0.0.1'}:${(+location.port || 80) + 1}`);
+const ROOT = new URL('..', location.href);            // the repo root (this page is <root>/web/game.html)
+let DATA = q.get('data');
+let MODE = null;                                       // /__mode answer in single-origin mode
+async function resolveEndpoints() {
+  try {
+    const r = await fetch(new URL('__mode', ROOT), { cache: 'no-store' });
+    if (r.ok && (r.headers.get('content-type') || '').includes('json')) MODE = await r.json();
+  } catch { /* plain static server: no /__mode */ }
+  if (!DATA) DATA = MODE && MODE.single ? new URL(MODE.data, ROOT).href.replace(/\/$/, '')
+    : HTTPS ? `https://${location.hostname}:8443`
+    : `${location.protocol}//${location.hostname || '127.0.0.1'}:${(+location.port || 80) + 1}`;
+}
 const snaps = (q.get('snap') || '').split(',').filter(Boolean).map(Number);
 const $ = id => document.getElementById(id);
 const logEl = $('log'), statEl = $('stat');
@@ -81,10 +93,20 @@ async function main() {
   }
   const t0 = performance.now();
   statEl.textContent = 'loading...';
-  const [module, exe, manifest, funcsTxt] = await Promise.all([
+  await resolveEndpoints();
+  log(`game data: ${DATA}` + (MODE && MODE.single ? ' (single-origin server)' : ''));
+  // Meridian.exe is read through the HttpBackend like every other game file, so it comes from the persistent block
+  // cache on later visits (recomp/host/vfs.mjs)
+  const manifestP = fetch(DATA + '/__manifest').then(r => { if (!r.ok) throw new Error('game server: ' + r.status); return r.json(); });
+  const httpBeP = manifestP.then(mf => new HttpBackend(DATA, mf));
+  const [module, exe, manifest, httpBe, funcsTxt] = await Promise.all([
     WebAssembly.compileStreaming(fetch('../recomp/out/hobbit_flat.wasm')),
-    fetch(DATA + '/Meridian.exe').then(r => { if (!r.ok) throw new Error('game server: ' + r.status); return r.arrayBuffer(); }).then(b => new Uint8Array(b)),
-    fetch(DATA + '/__manifest').then(r => r.json()),
+    httpBeP.then(be => {
+      const f = be.open('Meridian.exe', {});
+      if (!f) throw new Error('game server: no Meridian.exe in the game folder');
+      return f.read(0, f.size());
+    }),
+    manifestP, httpBeP,
     fetch('../recomp/out/funcs.txt').then(r => r.text()),
   ]);
   log(`wasm compiled + data manifest (${manifest.files.length} files) in ${(performance.now() - t0).toFixed(0)} ms`);
@@ -94,8 +116,8 @@ async function main() {
 
   const m = new Machine({ wasm: module, exe, clock: new RealClock(), log });
   await m.init();
-  const httpBe = new HttpBackend(DATA, manifest);
   const vfs = new VFS(httpBe, new MemBackend());
+  window.hobbit.http = httpBe;
   const W = new Win32(m, vfs, { onDebug: s => log('[dbg] ' + s.replace(/\s+$/, '')), knownDlls: ['shfolder.dll'] });
   const S = W.table();
   installDirectInput(m, W, S); installDirectSound(m, W, S);
@@ -118,7 +140,7 @@ async function main() {
     for (const [a, name] of MS) if (!reached.has(a) && m.r8(visAt + ordinal.get(a))) { reached.add(a); log(`== reached ${name} at Present ${n}`); }
     fpsN++; const now = performance.now(); if (now - fpsT > 1000) { fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; }
     if (n % 10 === 0) statEl.textContent = `Present ${n} | ${fps.toFixed(1)} fps | FE state ${m.r32(0x762b58)} | ` +
-      `http ${httpBe.fetches} req ${(httpBe.bytes / 1e6).toFixed(1)} MB | heap ${(m.heap.inuse / 1e6).toFixed(0)} MB`;
+      `http ${httpBe.fetches} req ${(httpBe.bytes / 1e6).toFixed(1)} MB` + (httpBe.storeHits ? ` (+${httpBe.storeHits} cached blocks)` : '') + ` | heap ${(m.heap.inuse / 1e6).toFixed(0)} MB`;
     window.hobbit.presents = n; window.hobbit.feState = m.r32(0x762b58);
     if (snaps.includes(n)) {   // ?snap=N,M: keep a copy of those frames under the canvas (proof screenshots)
       const img = new Image(); img.src = canvas.toDataURL('image/png'); img.title = 'Present ' + n; img.width = 320;
@@ -247,10 +269,15 @@ function setupMultiplayer(m, W) {
   const levelName = l => l === undefined || l < 0 ? 'menu' : (LEVELS[l] || 'level ' + l);
   const store = (k, v) => { try { if (v === undefined) return localStorage.getItem('hobbit.mp.' + k); localStorage.setItem('hobbit.mp.' + k, v); } catch { return null; } };
   const nameEl = $('mpName'), urlEl = $('mpUrl'), roomEl = $('mpRoom'), statusEl = $('mpStatus'), listEl = $('mpPlayers');
-  const defHost = location.protocol === 'https:' ? `wss://${location.hostname}:10000`
+  const legacyHost = location.protocol === 'https:' ? `wss://${location.hostname}:10000`
     : `${location.hostname || '127.0.0.1'}:${(+location.port || 80) + 2}`;
+  const singleRelay = MODE && MODE.single && MODE.relay;
+  const defHost = singleRelay ? new URL(MODE.relay, ROOT).href.replace(/^http/, 'ws') : legacyHost;
+  // a remembered server that was just the old default of this page becomes the new default (the relay moved to /relay)
+  let saved = store('url');
+  if (singleRelay && saved && saved.replace(/^wss?:\/\//, '') === legacyHost.replace(/^wss?:\/\//, '')) saved = null;
   nameEl.value = q.get('name') || store('name') || 'Hobbit';
-  urlEl.value = q.get('mp') || store('url') || defHost;
+  urlEl.value = q.get('mp') || saved || defHost;
   roomEl.value = q.get('room') || store('room') || 'main';
   const render = mp => {
     const me = mp.local ? levelName(mp.local.l) : 'menu';

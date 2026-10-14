@@ -45,6 +45,21 @@ WebAssembly (~120 MB, into `tools/`). Then it translates the exe to C and compil
 
 Click the canvas first to give it keyboard focus. Options: `--rebuild`, `--port N`, `--no-browser`.
 
+`--single` puts everything on **one port** instead: the page at `/`, the game folder at `/data/`, the multiplayer relay
+at `/relay` (WebSocket). The page finds out by itself (it asks `/__mode`). This is the default in Docker and what a
+login proxy such as Cloudflare Access needs, because one login then covers everything.
+
+**Traffic:** the wasm is sent gzip-compressed (34.7 MB -> 6.3 MB; `recomp/out/hobbit_flat.wasm.gz` is made once per
+build), every file is revalidated with an ETag, and the game data blocks the browser has read are kept in its Cache
+Storage (secure pages only: `https://` or `127.0.0.1` / `localhost`). Measured (Chrome, single-origin server):
+
+| | first visit | next visits |
+|---|---|---|
+| to the main menu | 170 requests, 20.3 MB | 14 requests, 7 KB |
+| into Dream World | ~580 requests, ~49 MB | 14 requests, 7 KB (0 game-data requests) |
+
+To free the space: DevTools > Application > Storage > Clear site data (the cache is called `hobbit-data-v1`).
+
 ### Controls
 
 **Keyboard and mouse:** the game's PC defaults. Arrows or W/S move, A/D strafe, Space jumps, Enter is Use and also skips
@@ -131,10 +146,46 @@ Two containers start:
 | you, on this PC | http://127.0.0.1:5190/web/game.html |
 | anyone you share the node with | https://hobbit-web.YOUR-TAILNET.ts.net/web/game.html |
 
-On the Tailscale address, the page is on 443, the game data on 8443 and the relay on 10000, all HTTPS (real
-certificates via `tailscale serve`, see `tailscale/serve.json`). The page finds the data and relay addresses by itself.
+The container runs the single-origin server (`--single`): page, game data (`/data/`) and relay (`/relay`) all on
+port 5190, which the Tailscale address serves on 443 with a real HTTPS certificate (`tailscale serve`, see
+`tailscale/serve.json`). The old separate ports stay on as well (data 5191 -> 8443, relay 5192 -> 10000), so older
+links and remembered relay addresses keep working. The page finds the data and relay addresses by itself.
 Your game folder is mounted read-only. The game files are streamed to the browsers that open the page, so share the node
 only with people who own the game.
+
+## Publish temporarily with Cloudflare (Tunnel + Access)
+
+For friends who don't use Tailscale: a Cloudflare Tunnel gives the game a public `https://` name on a domain you
+have in Cloudflare, and Cloudflare Access puts a login in front of it (only the email addresses you list, each gets a
+one-time PIN). Nothing is opened on your router; the `cloudflared` container dials out to Cloudflare. It shares the
+game container's network, so its `localhost` is the game and nothing else.
+
+**Only share it with people who own the game.** The page streams your game files to everyone who gets past the
+login. Keep the Access policy to an email allow-list, and turn the tunnel off when you're done.
+
+1. **Create the tunnel.** Cloudflare dashboard > Zero Trust > Networks > Tunnels > *Create a tunnel* > **Cloudflared**,
+   name it (e.g. `hobbit`), connector environment **Docker**. Copy only the token (the long string after `--token`)
+   and put it into **your** `.env` as `CF_TUNNEL_TOKEN=...`. Never commit it, paste it in chat or put it in `.env.example`.
+2. **Public hostname** (tab *Public Hostname* > *Add*): subdomain e.g. `hobbit`, your domain, path empty,
+   service type **HTTP**, URL **`127.0.0.1:5190`**, i.e. the service is `http://127.0.0.1:5190`. (`localhost:5190`
+   works too; `127.0.0.1` avoids an IPv6 lookup.) WebSockets are on by default; leave them on (the relay needs them).
+3. **Access application, before you start the tunnel:** Zero Trust > Access > Applications > *Add an application* >
+   **Self-hosted**, application domain = the same hostname (e.g. `hobbit.example.com`, path empty so it covers `/`,
+   `/data/` and `/relay`). Policy: action **Allow**, include **Emails** = your friends' addresses (and yours).
+   Login method: **One-time PIN** (Settings > Authentication, if it isn't on yet).
+4. **Start it:** `docker compose --profile cloudflare up -d` (the game containers keep running; only `cloudflared`
+   is added). `docker logs hobbit-cloudflared` should say *Registered tunnel connection*.
+5. Friends open `https://hobbit.example.com/web/game.html?name=TheirName&room=main` in Chrome 137+, enter their email,
+   type the PIN they get, and play. Multiplayer connects to `/relay` on the same name by itself.
+
+**Bandwidth per friend** (measured, see the Traffic table above): about 20 MB to the main menu and ~49 MB into Dream
+World on the first visit; later visits ~7 KB plus whatever new parts of the game they reach (game data is kept in
+the browser, keyed by the file's size and date, so it is only fetched again when your game files change). Cloudflare
+does not cache the game data by default (.DFS archives read with Range requests), so every first visit is served by your PC
+through the tunnel.
+
+**Turn it off:** `docker compose --profile cloudflare stop cloudflared` (or `rm -sf cloudflared`), then delete the
+public hostname or the whole tunnel in the dashboard. A plain `docker compose up -d` never starts `cloudflared`.
 
 ## Play with a friend
 
@@ -171,7 +222,8 @@ Docs: `docs/RECOMP.md` (translator), `docs/RECOMP_BOOT.md` (boot, host layer, ru
 
 | Path | What |
 |---|---|
-| `start.py`, `start.bat` | launcher (setup, build, servers) |
+| `start.py`, `start.bat` | launcher (setup, build, servers; `--single` = one-port server) |
+| `docker-compose.yml`, `Dockerfile`, `.env.example`, `tailscale/` | Docker: game + Tailscale node, optional `cloudflared` (profile `cloudflare`) |
 | `recomp/` | translator (`cfg.py`, `x86c.py`), `build.py`, C runtime, JS host layer, headless Node runner `boot_node.mjs`, capsule harness |
 | `web/` | `game.html` / `game.mjs` (the game page), `touch.mjs` (phone controls), `d3d8/` (Direct3D 8 on WebGL2 + its self-test `d3d8/test.html`) |
 | `auto/` | function boundaries, ABI table and cross-references for this exact exe (from the Ghidra analysis) |

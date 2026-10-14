@@ -28,9 +28,9 @@ was loaded. The menu text is the game's own bitmap font (section 6), not D3DXFon
 | `recomp/host/pe.mjs` | PE sections + import directory |
 | `recomp/host/win32.mjs` | KERNEL32/USER32/GDI32/SHELL32/WINMM/binkw32/shfolder shims, MSLU W functions, fake DLL images, message queue, SEH |
 | `recomp/host/dx.mjs` | DirectInput8 + DirectSound8 host COM objects; D3D8 via `web/d3d8/com.js` ComBridge; `nullGL()` for Node |
-| `recomp/host/vfs.mjs`, `node_fs.mjs` | path mapping (`C:\HOBBIT` = game folder read-only, `C:\APPDATA` = settings), Node fs backend, HTTP Range backend (64 KB block cache), memory backend |
+| `recomp/host/vfs.mjs`, `node_fs.mjs` | path mapping (`C:\HOBBIT` = game folder read-only, `C:\APPDATA` = settings), Node fs backend, HTTP Range backend (64 KB blocks: memory cache, then the persistent Cache API store `hobbit-data-v1` keyed by file + manifest version + size, then one Range request per run of missing blocks; no store in Node), memory backend |
 | `recomp/boot_node.mjs` | headless runner; writes `recomp/out/boot/{boot.log, summary.json, files.txt, entered.txt}` |
-| `recomp/serve_game.py` | read-only Range + CORS server for the game folder on 127.0.0.1:5191, `/__manifest` (launch.json `hobbit-game-data`) |
+| `recomp/serve_game.py` | read-only Range + CORS server for the game folder on 127.0.0.1:5191, `/__manifest` (`[path, size, version]`), ETag on every response, `?v=` URLs immutable (launch.json `hobbit-game-data`); `serve_path()` is reused by `start.py --single` under `/data/` |
 | `web/game.html`, `web/game.mjs` | Chrome page (served by `hobbit-web`, port 5190): JSPI, real d3d8.js device on the canvas, keyboard/mouse -> DirectInput, `?snap=20,90` keeps frames as images |
 | `web/d3d8/com.js` | fixed: full stdcall argument table (IDirect3D8::GetDeviceCaps = 3 args, surface LockRect/UnlockRect = 3/0), GetDirect3D / GetDisplayMode / GetCreationParameters (used by D3DX8), GeForce-class D3DCAPS8 (HW T&L, all blend/compare caps) |
 
@@ -41,6 +41,12 @@ node --experimental-wasm-jspi recomp/boot_node.mjs --frames 4000      # Node 24 
 python recomp/serve_game.py      &  python -m http.server 5190 --bind 127.0.0.1 --directory Hobbit-Decomp
 -> http://127.0.0.1:5190/web/game.html          (Chrome 137+: JSPI on by default; no Asyncify fallback)
 ```
+Single-origin alternative (what Docker and Cloudflare Access use): `python Hobbit-Decomp/webrepo/start.py --single [--mp]
+--game <dir> --port 5390` (launch.json `hobbit-single`) serves the repo at `/`, the game folder at `/data/`, the relay at
+`/relay` and `/__mode`; `web/game.mjs` asks `<repo>/__mode` and then uses `<repo>/data` and `ws(s)://<repo>/relay`
+(`?data=` / `?mp=` still win). Static files: gzip (wasm from `hobbit_flat.wasm.gz`, made at startup when stale) + ETag /
+`no-cache` revalidation. Measured first vs repeat visit: menu 170 req / 20.3 MB vs 14 req / 7 KB; Dream World ~580 req /
+~49 MB vs 14 req / 7 KB (0 game-data requests).
 Runner options: `--frames N`, `--seconds S`, `--trace N` (log the first N host calls), `--keys frame:DIK[:len],...`,
 `--vis-reset <addr>` (functions entered after a milestone), `--peek addr,...`.
 

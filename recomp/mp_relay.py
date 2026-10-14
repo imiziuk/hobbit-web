@@ -183,14 +183,37 @@ def handshake(sock):
         body = b"Hobbit Web multiplayer relay (WebSocket). Open the game page and connect to this address.\n"
         sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: %d\r\n\r\n%s" % (len(body), body))
         return False
-    accept = base64.b64encode(hashlib.sha1((key + WS_MAGIC).encode()).digest()).decode()
-    sock.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                  f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+    send_101(sock, key)
     return True
 
 
-def make_server(host, port, log=lambda s: print(s, flush=True)):
-    relay = Relay(log)
+def send_101(sock, key):
+    accept = base64.b64encode(hashlib.sha1((key + WS_MAGIC).encode()).digest()).decode()
+    sock.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                  f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+
+
+def serve_upgrade(handler, relay):
+    """WebSocket on an existing HTTP server (start.py single-origin mode, path /relay): `handler` is a
+    BaseHTTPRequestHandler that has parsed the upgrade request. Returns False if it is not a WebSocket upgrade.
+    Blocks until the client leaves; the HTTP connection is closed afterwards."""
+    key = handler.headers.get("Sec-WebSocket-Key")
+    if not key or "websocket" not in handler.headers.get("Upgrade", "").lower():
+        return False
+    sock = handler.connection
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.settimeout(20)                   # clients send at least one message per second
+    handler.close_connection = True
+    try:
+        send_101(sock, key)
+    except OSError:
+        return True
+    relay.handle(Conn(sock, handler.client_address))
+    return True
+
+
+def make_server(host, port, log=lambda s: print(s, flush=True), relay=None):
+    relay = relay or Relay(log)
 
     class H(socketserver.BaseRequestHandler):
         def handle(self):

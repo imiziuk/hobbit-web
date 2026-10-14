@@ -4,8 +4,14 @@
 # Networking: the game runs inside the network of its own Tailscale node "hobbit-web". Friends reach ONLY that node
 # (share just this machine from the Tailscale admin console); your PC and other devices stay private.
 #   on this PC:      http://127.0.0.1:5190/web/game.html
-#   over Tailscale:  https://hobbit-web.<your-tailnet>.ts.net/web/game.html   (page 443, game data 8443, relay 10000)
+#   over Tailscale:  https://hobbit-web.<your-tailnet>.ts.net/web/game.html
+# The game server is single-origin (start.py --single, default in Docker): page /, game data /data/, relay /relay, all
+# on port 5190. It also keeps the old data (5191) and relay (5192) ports for the Tailscale ports 8443 / 10000.
 # First start without TS_AUTHKEY: `docker logs hobbit-tailscale` prints a login link; open it once to add the node.
+#
+# Temporary public access through Cloudflare (README "Publish temporarily with Cloudflare"):
+#   docker compose --profile cloudflare up -d        (needs CF_TUNNEL_TOKEN in .env; tunnel service = http://127.0.0.1:5190)
+#   docker compose --profile cloudflare stop cloudflared      turns it off again
 services:
   tailscale:
     image: tailscale/tailscale:stable
@@ -39,6 +45,21 @@ services:
       - tools:/app/tools
       - venv:/app/.venv
       - cache:/app/cache
+
+  # Cloudflare Tunnel connector, only with `--profile cloudflare`. It shares the game's network namespace (the same as
+  # the hobbit container): its localhost IS the game, and your PC's services are not on its localhost. Point the tunnel's
+  # public hostname at http://127.0.0.1:5190 and nothing else, and protect it with a Cloudflare Access application
+  # (email allow-list + one-time PIN) BEFORE starting it.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: hobbit-cloudflared
+    profiles: [cloudflare]
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on: [hobbit]
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}  # from the Cloudflare dashboard; keep it only in .env (gitignored)
 
 volumes:
   ts-state:

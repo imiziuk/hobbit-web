@@ -8,7 +8,9 @@ import * as com from './d3d8/com.js';
 import { installMultiplayer } from '../recomp/host/mp.mjs';
 
 const q = new URLSearchParams(location.search);
-const DATA = q.get('data') || 'http://127.0.0.1:5191';
+// game data server: ?data=..., else the host this page was opened from, on the next port (on this machine that is
+// 127.0.0.1:5191 as before)
+const DATA = q.get('data') || `${location.protocol}//${location.hostname || '127.0.0.1'}:${(+location.port || 80) + 1}`;
 const snaps = (q.get('snap') || '').split(',').filter(Boolean).map(Number);
 const $ = id => document.getElementById(id);
 const logEl = $('log'), statEl = $('stat');

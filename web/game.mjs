@@ -6,6 +6,7 @@ import { Win32 } from '../recomp/host/win32.mjs';
 import { installDirectInput, installDirectSound, installD3D8 } from '../recomp/host/dx.mjs';
 import * as com from './d3d8/com.js';
 import { installMultiplayer } from '../recomp/host/mp.mjs';
+import { installTouch, mergePads } from './touch.mjs';
 
 const q = new URLSearchParams(location.search);
 // game data server: ?data=..., else the host this page was opened from, on the next port (on this machine that is
@@ -32,10 +33,50 @@ const DIK = { Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, 
   ArrowDown: 208, PageDown: 209, Insert: 210, Delete: 211, Numpad0: 82, Numpad1: 79, Numpad2: 80, Numpad3: 81, Numpad4: 75, Numpad5: 76,
   Numpad6: 77, Numpad7: 71, Numpad8: 72, Numpad9: 73 };
 
+// Phone UI: "Phone controls" checkbox (URL ?touch=1|0, else remembered, else on for a coarse primary pointer), the touch
+// overlay (web/touch.mjs), Fullscreen + landscape lock, and the panels drawer. Works before the game starts.
+const phone = { mode: () => 'menu' };
+function setupPhoneUI() {
+  const box = $('touchOn'), stage = $('stage');
+  const ls = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } };
+  const qt = q.get('touch'), saved = ls('hobbit.touch');
+  const coarse = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+  const on0 = qt === '1' || qt === 'true' ? true : qt === '0' || qt === 'false' ? false : saved !== null ? saved === '1' : coarse;
+  phone.touch = installTouch(stage, () => phone.mode());
+  const apply = (on, remember) => {
+    box.checked = on; phone.touch.setEnabled(on);
+    document.body.classList.toggle('touch', on); if (!on) document.body.classList.remove('panels');
+    if (remember) ls('hobbit.touch', on ? '1' : '0');
+  };
+  box.addEventListener('change', () => apply(box.checked, true));
+  apply(on0, false);
+  $('panelsBtn').onclick = () => document.body.classList.add('panels');
+  $('panelsClose').onclick = () => document.body.classList.remove('panels');
+  const fsBtn = $('fsBtn'), fsEl = () => document.fullscreenElement || document.webkitFullscreenElement;
+  fsBtn.onclick = async () => {
+    try {
+      if (fsEl()) { await (document.exitFullscreen || document.webkitExitFullscreen).call(document); return; }
+      // phone mode: the whole page (so the panels drawer still opens); desktop: just the game
+      const t = document.body.classList.contains('touch') ? document.documentElement : stage;
+      await (t.requestFullscreen || t.webkitRequestFullscreen).call(t, { navigationUI: 'hide' });
+      if (screen.orientation && screen.orientation.lock) await screen.orientation.lock('landscape').catch(() => {});
+    } catch (e) { log('fullscreen: ' + e.message); }
+  };
+  const fsChange = () => { fsBtn.textContent = fsEl() ? 'Exit fullscreen' : 'Fullscreen'; };
+  document.addEventListener('fullscreenchange', fsChange); document.addEventListener('webkitfullscreenchange', fsChange);
+  if (!document.fullscreenEnabled && !document.webkitFullscreenEnabled) fsBtn.hidden = true;   // e.g. iPhone Safari
+}
+
 async function main() {
+  setupPhoneUI();
   if (typeof WebAssembly.Suspending !== 'function' || typeof WebAssembly.promising !== 'function') {
     log('JSPI (WebAssembly.Suspending / promising) is not available in this browser. Chrome 137+ has it by default; ' +
       'older Chrome: enable chrome://flags/#enable-experimental-webassembly-jspi. Not falling back to Asyncify.');
+    const nj = $('nojspi'); nj.hidden = false;
+    nj.innerHTML = '<strong>This browser cannot run the game.</strong> It needs WebAssembly JSPI, which is in ' +
+      '<strong>Chrome 137+ (or Edge 137+) on Android or desktop</strong>. iPhone and iPad browsers (Safari, and Chrome on iOS, ' +
+      'which uses the same engine) do not support it yet.';
+    document.body.classList.remove('touch'); if (phone.touch) phone.touch.setEnabled(false);
     statEl.textContent = 'no JSPI'; return;
   }
   const t0 = performance.now();
@@ -109,18 +150,51 @@ async function main() {
     W.input.mouse.b[bi] = 1; (W.input.mouse.latch ||= [0, 0, 0, 0])[bi] = 3;
     const [x, y] = gameXY(e), b = BTN[e.button]; if (b) W.mouseEvent(b[0], x, y, mk());
   });
+  // touch / pen on the canvas (phone menus: the overlay's drag areas are off there): a tap = move cursor + left click.
+  // Like a real mouse, the cursor arrives first and the menu highlights the item before the button goes down: the
+  // down is sent 120 ms after the move (a few frames), and the up at least 100 ms after the down, so the game's
+  // per-frame polling cannot miss a quick tap.
+  // preventDefault on pointerdown stops the browser's compatibility mouse events, so the mouse handlers don't double it.
+  let touchId = null, touchXY = [0, 0], downAt = 0, downTimer = 0, upPending = false;
+  const sendDown = () => {
+    downTimer = 0; downAt = performance.now();
+    W.input.mouse.b[0] = 1; (W.input.mouse.latch ||= [0, 0, 0, 0])[0] = 3;
+    W.mouseEvent(0x201, touchXY[0], touchXY[1], 1);
+    if (upPending) setTimeout(sendUp, 100);
+  };
+  const sendUp = () => { upPending = false; W.input.mouse.b[0] = 0; W.mouseEvent(0x202, touchXY[0], touchXY[1], 0); };
+  canvas.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' || touchId !== null || downTimer || upPending) return;
+    e.preventDefault(); canvas.focus({ preventScroll: true }); touchId = e.pointerId;
+    touchXY = gameXY(e); W.mouseEvent(0x200, touchXY[0], touchXY[1], 0);
+    downTimer = setTimeout(sendDown, 120);
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (e.pointerId !== touchId) return;
+    e.preventDefault(); touchXY = gameXY(e); W.mouseEvent(0x200, touchXY[0], touchXY[1], downTimer ? 0 : 1);
+  });
+  const touchUp = e => {
+    if (e.pointerId !== touchId) return;
+    touchId = null;
+    if (downTimer) { upPending = true; return; }             // the down is still queued: sendDown schedules the up
+    const wait = 100 - (performance.now() - downAt);
+    if (wait > 0) { upPending = true; setTimeout(sendUp, wait); } else sendUp();
+  };
+  canvas.addEventListener('pointerup', touchUp); canvas.addEventListener('pointercancel', touchUp);
   window.addEventListener('mouseup', e => {
     W.input.mouse.b[e.button === 2 ? 1 : e.button === 1 ? 2 : 0] = 0;
     const [x, y] = gameXY(e), b = BTN[e.button]; if (b) W.mouseEvent(b[1], x, y, mk());
   });
   // gamepad: Gamepad API, read whenever the game polls its DirectInput joystick (recomp/host/dx.mjs padState)
-  W.input.readPad = () => {
+  // + the phone overlay (web/touch.mjs), merged: buttons ORed, the larger-magnitude value per axis
+  const physPad = () => {
     const g = [...(navigator.getGamepads ? navigator.getGamepads() : [])].find(p => p && p.connected);
     if (!g) return null;
     const val = i => (g.buttons[i] ? g.buttons[i].value : 0);
     return { axes: [g.axes[0] || 0, g.axes[1] || 0, g.axes[2] || 0, g.axes[3] || 0, val(6), val(7)],
              buttons: g.buttons.map(b => b.pressed || b.value > 0.5) };
   };
+  W.input.readPad = () => mergePads(physPad(), phone.touch ? phone.touch.state() : null);
   // menus vs gameplay: gameplay = Game_LevelLoop running (0x760354), logic not paused (0x7600f4) and the in-game pause
   // menu closed (0x76321c: a field of the pause object, 0 -> 1 while it is open; found by diffing the globals)
   // cutscene = Bilbo's input disabled by a cinema (g_pBilbo 0x75ba3c, +0x44c set by 00422980 "CINEMA: Bilbo Input set FALSE")
@@ -129,13 +203,21 @@ async function main() {
     const b = m.r32(0x75ba3c);
     return b && m.r32(b + 0x44c) === 1 ? 'cutscene' : 'game';
   };
+  phone.mode = W.input.padMode;   // the touch overlay switches its labels and drag areas with it
   // pad buttons that act as keys (held while the button is held). Gameplay: Start = Esc (pause). Cutscenes: Start = Enter
   // ("Press Enter to skip"). Menus and movies: Start = Enter (skips movies), B = Esc (back). Enter is not sent in gameplay
   // because it is bound to Use there. A timer, not rAF, so it keeps working in a background tab.
+  // The key is chosen when the button goes down and kept until it is released: otherwise Start = Esc opened the pause
+  // menu, the mode became 'menu' while Start was still held, and the same press turned into Enter = "Exit Game".
   const padHeld = { 1: false, 28: false };
+  let startKey = 0, bKey = 0;
   setInterval(() => {
     const g = W.input.readPad(), mode = W.input.padMode(), menu = mode === 'menu', want = { 1: false, 28: false };
-    if (g) { if (g.buttons[9]) want[mode === 'game' ? 1 : 28] = true; if (menu && g.buttons[1]) want[1] = true; }
+    const st = !!(g && g.buttons[9]), bb = !!(g && g.buttons[1]);
+    if (!st) startKey = 0; else if (!startKey) startKey = mode === 'game' ? 1 : 28;
+    if (!bb) bKey = 0; else if (!bKey) bKey = menu ? 1 : -1;      // -1: pressed outside a menu, sends nothing
+    if (startKey) want[startKey] = true;
+    if (bKey > 0) want[bKey] = true;
     for (const k of [1, 28]) if (want[k] !== padHeld[k]) { padHeld[k] = want[k]; keys[k] = want[k] ? 0x80 : 0; }
   }, 16);
   const padEl = $('pad');

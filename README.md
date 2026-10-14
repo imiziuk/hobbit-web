@@ -66,6 +66,36 @@ game as a DirectInput joystick, so the game's own *Options → Controls → Game
 | Start | Pause | Skip movie / cutscene |
 | D-pad | Walking-stick (left), Stones (up), Sword (right) | Navigate |
 
+### Phone (Android)
+
+The game runs in **Chrome 137+ on Android** with on-screen touch controls. The game still runs on your PC's
+servers; the phone only opens the page.
+
+1. Make the page reachable from the phone: `python start.py --lan` (same Wi-Fi, or Tailscale on both), or use the
+   Docker + Tailscale setup below (HTTPS, works from anywhere on your tailnet).
+2. On the phone, open `http://<PC address>:5190/web/game.html` (or the `https://hobbit-web.…ts.net/web/game.html` address).
+3. Tap **Fullscreen** and turn the phone sideways. The first load downloads the 35 MB wasm, so use Wi-Fi.
+
+**Phone controls** switch on by themselves on a touch screen. The checkbox in the top-left corner turns them on or
+off (it is remembered), and `?touch=1` or `?touch=0` in the address forces it. They act as a virtual gamepad, so the
+buttons do what the gamepad table above says:
+
+| On screen | In game | In menus |
+|---|---|---|
+| Left half: touch and drag | Move (a joystick appears under your thumb) | |
+| Right half: touch and drag | Camera | |
+| A / B / X / Y (labelled) | Jump / Crouch / Attack / Use | OK / Back / - / OK |
+| D-pad (top left) | Walking-stick, Stones, Sword | Navigate |
+| LB / RB, Back, Start (top) | Ring / Target, Toggle view, Pause | Start = Enter (skips movies and cutscenes) |
+| Tap a menu item | | Selects it, like a mouse click |
+
+The labels change between gameplay, cutscenes and menus. **Panels** opens the log and the Multiplayer panel as a
+drawer. A physical controller still works alongside the touch controls.
+
+**iPhone / iPad: not supported.** The game needs WebAssembly JSPI, which lets the translated code wait for the
+browser mid-function. Safari doesn't have it, and every iOS browser (Chrome included) is Safari underneath. The page
+says so instead of starting. The only alternative is Asyncify, which would make the 35 MB module much bigger and slower.
+
 Verified game version: Meridian.exe md5 `3e351efeea5c7e1eb55095d8f5b12fab` (retail PC). Other versions will warn,
 because the translation tables in `auto/` describe this exact binary.
 
@@ -143,7 +173,7 @@ Docs: `docs/RECOMP.md` (translator), `docs/RECOMP_BOOT.md` (boot, host layer, ru
 |---|---|
 | `start.py`, `start.bat` | launcher (setup, build, servers) |
 | `recomp/` | translator (`cfg.py`, `x86c.py`), `build.py`, C runtime, JS host layer, headless Node runner `boot_node.mjs`, capsule harness |
-| `web/` | `game.html` / `game.mjs` (the game page), `d3d8/` (Direct3D 8 on WebGL2 + its self-test `d3d8/test.html`) |
+| `web/` | `game.html` / `game.mjs` (the game page), `touch.mjs` (phone controls), `d3d8/` (Direct3D 8 on WebGL2 + its self-test `d3d8/test.html`) |
 | `auto/` | function boundaries, ABI table and cross-references for this exact exe (from the Ghidra analysis) |
 | `d3drec/` | proxy `d3d8.dll` that records the original game's D3D calls + a Chrome replayer that diffs the frames |
 
@@ -157,3 +187,5 @@ and `HOBBIT_EXE`, or use the default sibling paths.
 - Saving settings in the browser.
 - Testing beyond Dream World.
 - Gamepad: tested with a simulated pad (menus, New Game, skipping, moving, pause menu); not yet with a physical controller.
+- Phone: tested in Chrome's phone emulation with simulated touches (menus, New Game, skipping, running, jumping,
+  camera, pause); not yet on a real phone. Expect a lower frame rate than on a PC.

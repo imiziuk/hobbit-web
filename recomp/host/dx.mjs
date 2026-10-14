@@ -42,8 +42,8 @@ const putGuid = (m, p, g) => { for (let i = 0; i < 16; i++) m.w8(p + i, parseInt
 
 /** Fill a DIJOYSTATE2 (n bytes) from the page's gamepad snapshot (W3C "standard" mapping).
  *  Axes follow the game's default bindings (Options > Controls > Gamepad): Move = lX/lY (left stick), Camera = lZ/lRz
- *  (right stick, the classic DirectInput dual-analog layout). POV 0 = D-pad (Walking-stick left, Stones up, Sword right;
- *  menu navigation). Buttons are placed on the DirectInput indices the game binds by default (0-based, as its Controls
+ *  (right stick, the classic DirectInput dual-analog layout). POV 0 = D-pad (Walking-stick left, Stones up, Sword right);
+ *  in menus the D-pad is sent as the left stick instead. Buttons are placed on the DirectInput indices the game binds by default (0-based, as its Controls
  *  screen shows them): 0 Toggle View, 1 Equip Ring, 2 Jump, 3 Attack, 4 Crouch, 5 Use (also menu accept), 7 Target.
  *    gameplay: A=Jump X=Attack B=Crouch Y=Use LB=Ring RB=Target Back=Toggle view (Start = Esc, sent by the page)
  *    menus:    A and Y = accept (Use); B = Esc, Start = Enter (skips movies) (both sent by the page)
@@ -55,6 +55,14 @@ export function padState(m, s, W, p, n) {
   for (let i = 0; i < 4 && 32 + 4 * i + 4 <= n; i++) m.w32(p + 32 + 4 * i, 0xffffffff);   // POVs centred
   const g = W.input.readPad && W.input.readPad();
   const v = g ? [g.axes[0], g.axes[1], g.axes[2], 0, 0, g.axes[3]] : [0, 0, 0, 0, 0, 0];   // lX lY lZ lRx lRy lRz
+  // Menus: the D-pad goes out as the left stick, not the POV. With the POV a short press moved the menu cursor two
+  // items (measured in the browser: 40 ms on the POV = 2 steps, the same time on lY = 1 step).
+  const menu = W.input.padMode && W.input.padMode() === 'menu';
+  if (g && menu) {
+    const b = g.buttons;
+    if (b[12] || b[13]) v[1] = b[12] ? -1 : 1;
+    if (b[14] || b[15]) v[0] = b[14] ? -1 : 1;
+  }
   v.forEach((x, i) => {
     const r = s.range.get(i) || [-1000, 1000], dz = s.dead.get(i) || 0;
     let a = Math.max(-1, Math.min(1, x || 0)); if (Math.abs(a) * 10000 < dz) a = 0;
@@ -63,8 +71,8 @@ export function padState(m, s, W, p, n) {
   if (!g) return;
   const b = g.buttons, up = b[12], dn = b[13], lf = b[14], rt = b[15];
   const pov = up && rt ? 4500 : rt && dn ? 13500 : dn && lf ? 22500 : lf && up ? 31500 : up ? 0 : rt ? 9000 : dn ? 18000 : lf ? 27000 : -1;
-  if (pov >= 0 && n >= 36) m.w32(p + 32, pov);
-  const map = W.input.padMode && W.input.padMode() === 'menu' ? PAD_BTN_MENU : PAD_BTN_GAME;
+  if (pov >= 0 && n >= 36 && !menu) m.w32(p + 32, pov);
+  const map = menu ? PAD_BTN_MENU : PAD_BTN_GAME;
   for (const [src, di] of Object.entries(map)) if (b[src] && 48 + di < n) m.w8(p + 48 + di, 0x80);
 }
 

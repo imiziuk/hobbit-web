@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Hobbit Recompiled</title>
 <style>
   :root { --bg: #111; --fg: #ddd; --muted: #888; --panel: #1b1b1b; }
@@ -20,12 +20,55 @@
   #mp button { background: #2a2a2a; color: var(--fg); border: 1px solid #444; padding: 3px 10px; font: inherit; cursor: pointer; }
   #mpStatus { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; }
   #mpPlayers { margin: 0; padding-left: 18px; font-size: 12px; }
+  #stage { position: relative; max-width: 640px; }
+  #opts { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 6px 0; font-size: 12px; }
+  #opts button, #panelsClose { background: #2a2a2a; color: var(--fg); border: 1px solid #444; padding: 3px 10px; font: inherit; cursor: pointer; }
+  #opts .phone-only { display: none; }
+  #nojspi { background: #3a1a1a; border: 1px solid #844; padding: 10px 12px; margin: 8px 0; max-width: 616px; }
+  #rotate { display: none; }
+  #panelsClose { display: none; }
+  body.touch.panels #panelsClose { display: inline-block; margin-bottom: 8px; }
+  /* phone mode (Phone controls on): the game fills the screen, the panels become a drawer */
+  body.touch { overflow: hidden; overscroll-behavior: none; }
+  body.touch main { max-width: none; padding: 0; }
+  body.touch h1 { display: none; }
+  body.touch #stage { position: fixed; inset: 0; max-width: none; background: #000; touch-action: none;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; z-index: 1; }
+  body.touch #screen { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: none;
+    width: min(100vw, calc(100dvh * 4 / 3)); height: auto; touch-action: none; }
+  body.touch #opts { position: absolute; left: 6px; top: 8px; margin: 0; z-index: 6; gap: 6px; font-size: 11px;
+    background: rgba(0,0,0,.45); padding: 3px 6px; border-radius: 6px; color: #ccc; white-space: nowrap; }
+  body.touch #opts button { padding: 2px 7px; }
+  body.touch #opts .phone-only { display: inline-block; }
+  body.touch #side { display: none; }
+  body.touch.panels #side { display: block; position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 92vw);
+    overflow: auto; background: var(--bg); padding: 10px 12px 60px; z-index: 10; box-shadow: -4px 0 16px #000; touch-action: pan-y; }
+  body.touch.panels #log { height: 180px; }
+  #stage:fullscreen { max-width: none; background: #000; }
+  #stage:fullscreen #screen { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); max-width: none;
+    width: min(100vw, calc(100vh * 4 / 3)); height: auto; }
+  #stage:fullscreen #opts { position: absolute; left: 8px; top: 4px; margin: 0; z-index: 6; }
+  @media (orientation: portrait) {
+    body.touch #rotate { display: block; position: absolute; left: 0; right: 0; top: 8px; text-align: center; color: #ccc; z-index: 6;
+      pointer-events: none; font-size: 13px; }
+  }
 </style>
 </head>
 <body>
 <main>
   <h1>The Hobbit (2003), recompiled x86 → WebAssembly</h1>
-  <canvas id="screen" width="640" height="480" tabindex="0"></canvas>
+  <div id="nojspi" hidden></div>
+  <div id="stage">
+    <canvas id="screen" width="640" height="480" tabindex="0"></canvas>
+    <div id="rotate">Turn the phone sideways (landscape)</div>
+    <div id="opts">
+      <label><input type="checkbox" id="touchOn"> Phone controls</label>
+      <button id="fsBtn" type="button">Fullscreen</button>
+      <button id="panelsBtn" type="button" class="phone-only">Panels</button>
+    </div>
+  </div>
+  <div id="side">
+  <button id="panelsClose" type="button" class="phone-close">Close panels</button>
   <div id="stat">idle</div>
   <div id="pad" style="color:var(--muted);font-size:12px">No gamepad yet: plug one in and press any button.</div>
   <section id="mp" aria-label="Multiplayer">
@@ -40,7 +83,9 @@
   <div id="snaps"></div>
   <pre id="log"></pre>
   <p class="note">Runs recomp/out/hobbit_flat.wasm from the real entry point with JSPI green threads and the web/d3d8 WebGL2 device.
-    Game files are read with HTTP Range requests from recomp/serve_game.py (127.0.0.1:5191, read-only). Keyboard, mouse and gamepad (Gamepad API, as a DirectInput joystick) go to the game.</p>
+    Game files are read with HTTP Range requests from recomp/serve_game.py (127.0.0.1:5191, read-only). Keyboard, mouse and gamepad (Gamepad API, as a DirectInput joystick) go to the game.
+    Phone controls: an on-screen virtual gamepad (left half = move stick, right half = camera drag, A/B/X/Y, D-pad, Start/Back, LB/RB); in menus, tap the menu items.</p>
+  </div>
 </main>
 <script type="module" src="game.mjs"></script>
 </body>

@@ -133,3 +133,23 @@ That needs multi-entry functions or a "resume at address" path in the translator
 - Tested in the browser pane: real mouse hover and click through Options → Controls → Gamepad, and a simulated
   standard gamepad through menu → New Game → skip movie and cutscene → run → pause menu (navigate, open Audio, back)
   → resume. Not yet tested with a physical controller.
+
+## Phone / touch controls (Oct 14)
+- `web/touch.mjs` (page-only; boot_node never loads it) draws an overlay in `#stage` that behaves as a virtual W3C standard
+  gamepad. `W.input.readPad()` = `mergePads(physical, touch)`: the buttons are ORed, and each axis takes the value with
+  the larger magnitude. Left half = floating stick (left stick); right half = drag stick (right stick, its anchor
+  follows the finger beyond the radius); A/B/X/Y, D-pad, LB/RB, Back/Start buttons. Pointer events, multi-touch, `touch-action: none`.
+- The labels and drag areas follow `padMode()` every 100 ms. In `menu` mode the drag areas are `pointer-events: none`, so a
+  tap reaches the canvas: pointerdown (non-mouse, preventDefault so there are no compatibility mouse events) -> WM_MOUSEMOVE,
+  WM_LBUTTONDOWN 120 ms later, WM_LBUTTONUP >= 100 ms after that. Verified: tap Options -> Options screen, tap DONE, tap New Game.
+- Checkbox "Phone controls": `?touch=1|0`, then localStorage `hobbit.touch`, then `(pointer: coarse)`. `body.touch` = fixed
+  full-screen stage (canvas 4:3 contained), panels in a drawer ("Panels"). Fullscreen button: documentElement in phone
+  mode, `#stage` on desktop, + `screen.orientation.lock('landscape')`. No JSPI -> message (iOS can't run it).
+- Two pad fixes found with it (they apply to physical pads too):
+  1. Menus: a D-pad press moved the cursor two items (POV; the same press on lY moved one). `padState` now sends the D-pad
+     as the left stick in `menu` mode, with no POV.
+  2. Start = Esc opened the pause menu, then the mode became `menu` while Start was still held, so the page sent Enter
+     and selected "Exit Game". The Start/B key is now chosen on press and kept until release.
+- Tested in the browser pane (synthetic touch PointerEvents, 800x450 and a 640x360 emulated phone): D-pad 1 step per tap,
+  canvas taps, New Game, Start skips the movie and the cutscenes, the left stick runs Bilbo (moved ~350 units in 1.5 s), A jumps (Y +94),
+  camera drag rotates the view, Start pauses, B resumes, checkbox off restores the desktop layout. Not tried on a real phone.

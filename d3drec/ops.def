@@ -1,0 +1,217 @@
+# d3drec op table: the ONE definition of every record in a .d3dr log.
+# gen_ops.py turns it into src/ops_gen.h (C++ recorder) and ops.js (JS reader). Edit here, then run gen_ops.py.
+#
+# <code> <Interface>::<Method> <sig>
+# code: 0..96 IDirect3DDevice8 vtable index | 100+ IDirect3D8 | 120+ IDirect3DTexture8 | 140+ IDirect3DSurface8
+#       152+ IDirect3DVertexBuffer8 | 166+ IDirect3DIndexBuffer8 | 192+ meta records | 240 HR prefix
+# Interface records (code < 192) start with the varuint id of `this`; meta records do not.
+# sig (fields after `this`, in order; '-' = no fields):
+#   u varuint32          i zigzag varint32       d raw u32 (4 bytes LE)   f raw f32
+#   o object id (varuint, 0 = NULL / not a wrapped object)
+#   r optional RECT (u8 0|1, then 4 x i)          R RECT/D3DRECT list (varuint n+1, 0 = NULL; then n x 4 i)
+#   P POINT list (varuint n+1, 0 = NULL; then n x 2 i)
+#   M matrix through a 4096-slot cache shared by all M fields: u8 0 = NULL | 1 = new (16 x f32; stored in slot
+#     (newCount++ & 4095)) | 2 = cached (varuint slot)
+#   B bytes (varuint len+1, 0 = NULL; then len bytes)   s string (same as B, UTF-8)
+#   X lock data: u8 kind: 0 none | 1 NEW (u blobId, u len, bytes) | 2 REF (u blobId) | 3 DIFF (u nSpans, nSpans x (u skip, u len, bytes))
+#     (DIFF spans are relative to the locked range; skip counts from the end of the previous span; DrawPrimitiveUP /
+#     DrawIndexedPrimitiveUP vertex and index data use X too, so text/fog quads repeated every frame cost a REF)
+
+# ---------------------------------------------------------------- IDirect3DDevice8
+0   Device::QueryInterface            Bo
+1   Device::AddRef                    u
+2   Device::Release                   u
+3   Device::TestCooperativeLevel      -
+4   Device::GetAvailableTextureMem    u
+5   Device::ResourceManagerDiscardBytes u
+6   Device::GetDirect3D               o
+7   Device::GetDeviceCaps             B
+8   Device::GetDisplayMode            B
+9   Device::GetCreationParameters     B
+10  Device::SetCursorProperties       uuo
+11  Device::SetCursorPosition         iid
+12  Device::ShowCursor                uu
+13  Device::CreateAdditionalSwapChain Bo
+14  Device::Reset                     B
+15  Device::Present                   rrduuu
+16  Device::GetBackBuffer             uuo
+17  Device::GetRasterStatus           -
+18  Device::SetGammaRamp              dB
+19  Device::GetGammaRamp              B
+20  Device::CreateTexture             uuudddo
+21  Device::CreateVolumeTexture       uuuudddo
+22  Device::CreateCubeTexture         uudddo
+23  Device::CreateVertexBuffer        udddo
+24  Device::CreateIndexBuffer         udddo
+25  Device::CreateRenderTarget        uudduo
+26  Device::CreateDepthStencilSurface uuddo
+27  Device::CreateImageSurface        uudo
+28  Device::CopyRects                 oRoP
+29  Device::UpdateTexture             oo
+30  Device::GetFrontBuffer            o
+31  Device::SetRenderTarget           oo
+32  Device::GetRenderTarget           o
+33  Device::GetDepthStencilSurface    o
+34  Device::BeginScene                -
+35  Device::EndScene                  -
+36  Device::Clear                     Rddfd
+37  Device::SetTransform              uM
+38  Device::GetTransform              uM
+39  Device::MultiplyTransform         uM
+40  Device::SetViewport               B
+41  Device::GetViewport               B
+42  Device::SetMaterial               B
+43  Device::GetMaterial               B
+44  Device::SetLight                  uB
+45  Device::GetLight                  uB
+46  Device::LightEnable               uu
+47  Device::GetLightEnable            uu
+48  Device::SetClipPlane              uB
+49  Device::GetClipPlane              uB
+50  Device::SetRenderState            uu
+51  Device::GetRenderState            uu
+52  Device::BeginStateBlock           -
+53  Device::EndStateBlock             d
+54  Device::ApplyStateBlock           d
+55  Device::CaptureStateBlock         d
+56  Device::DeleteStateBlock          d
+57  Device::CreateStateBlock          ud
+58  Device::SetClipStatus             B
+59  Device::GetClipStatus             B
+60  Device::GetTexture                uo
+61  Device::SetTexture                uo
+62  Device::GetTextureStageState      uuu
+63  Device::SetTextureStageState      uuu
+64  Device::ValidateDevice            u
+65  Device::GetInfo                   uu
+66  Device::SetPaletteEntries         uB
+67  Device::GetPaletteEntries         uB
+68  Device::SetCurrentTexturePalette  u
+69  Device::GetCurrentTexturePalette  u
+70  Device::DrawPrimitive             uuu
+71  Device::DrawIndexedPrimitive      uuuuu
+72  Device::DrawPrimitiveUP           uuuX
+73  Device::DrawIndexedPrimitiveUP    uuuuduXX
+74  Device::ProcessVertices           uuuod
+75  Device::CreateVertexShader        BBdd
+76  Device::SetVertexShader           d
+77  Device::GetVertexShader           d
+78  Device::DeleteVertexShader        d
+79  Device::SetVertexShaderConstant   uB
+80  Device::GetVertexShaderConstant   uu
+81  Device::GetVertexShaderDeclaration d
+82  Device::GetVertexShaderFunction   d
+83  Device::SetStreamSource           uou
+84  Device::GetStreamSource           uou
+85  Device::SetIndices                ou
+86  Device::GetIndices                ou
+87  Device::CreatePixelShader         Bd
+88  Device::SetPixelShader            d
+89  Device::GetPixelShader            d
+90  Device::DeletePixelShader         d
+91  Device::SetPixelShaderConstant    uB
+92  Device::GetPixelShaderConstant    uu
+93  Device::GetPixelShaderFunction    d
+94  Device::DrawRectPatch             u
+95  Device::DrawTriPatch              u
+96  Device::DeletePatch               u
+
+# ---------------------------------------------------------------- IDirect3D8
+100 D3D::QueryInterface               Bo
+101 D3D::AddRef                       u
+102 D3D::Release                      u
+103 D3D::RegisterSoftwareDevice       -
+104 D3D::GetAdapterCount              u
+105 D3D::GetAdapterIdentifier         udB
+106 D3D::GetAdapterModeCount          uu
+107 D3D::EnumAdapterModes             uuB
+108 D3D::GetAdapterDisplayMode        uB
+109 D3D::CheckDeviceType              uuddu
+110 D3D::CheckDeviceFormat            uuddud
+111 D3D::CheckDeviceMultiSampleType   uuduu
+112 D3D::CheckDepthStencilMatch       uuddd
+113 D3D::GetDeviceCaps                uuB
+114 D3D::GetAdapterMonitor            ud
+115 D3D::CreateDevice                 uuddBo
+
+# ---------------------------------------------------------------- IDirect3DTexture8
+120 Texture::QueryInterface           Bo
+121 Texture::AddRef                   u
+122 Texture::Release                  u
+123 Texture::GetDevice                o
+124 Texture::SetPrivateData           -
+125 Texture::GetPrivateData           -
+126 Texture::FreePrivateData          -
+127 Texture::SetPriority              uu
+128 Texture::GetPriority              u
+129 Texture::PreLoad                  -
+130 Texture::GetType                  u
+131 Texture::SetLOD                   uu
+132 Texture::GetLOD                   u
+133 Texture::GetLevelCount            u
+134 Texture::GetLevelDesc             uB
+135 Texture::GetSurfaceLevel          uo
+136 Texture::LockRect                 urd
+137 Texture::UnlockRect               uuuX
+138 Texture::AddDirtyRect             r
+
+# ---------------------------------------------------------------- IDirect3DSurface8
+140 Surface::QueryInterface           Bo
+141 Surface::AddRef                   u
+142 Surface::Release                  u
+143 Surface::GetDevice                o
+144 Surface::SetPrivateData           -
+145 Surface::GetPrivateData           -
+146 Surface::FreePrivateData          -
+147 Surface::GetContainer             Bo
+148 Surface::GetDesc                  B
+149 Surface::LockRect                 rd
+150 Surface::UnlockRect               uuX
+
+# ---------------------------------------------------------------- IDirect3DVertexBuffer8
+152 VB::QueryInterface                Bo
+153 VB::AddRef                        u
+154 VB::Release                       u
+155 VB::GetDevice                     o
+156 VB::SetPrivateData                -
+157 VB::GetPrivateData                -
+158 VB::FreePrivateData               -
+159 VB::SetPriority                   uu
+160 VB::GetPriority                   u
+161 VB::PreLoad                       -
+162 VB::GetType                       u
+163 VB::Lock                          uud
+164 VB::Unlock                        X
+165 VB::GetDesc                       B
+
+# ---------------------------------------------------------------- IDirect3DIndexBuffer8
+166 IB::QueryInterface                Bo
+167 IB::AddRef                        u
+168 IB::Release                       u
+169 IB::GetDevice                     o
+170 IB::SetPrivateData                -
+171 IB::GetPrivateData                -
+172 IB::FreePrivateData               -
+173 IB::SetPriority                   uu
+174 IB::GetPriority                   u
+175 IB::PreLoad                       -
+176 IB::GetType                       u
+177 IB::Lock                          uud
+178 IB::Unlock                        X
+179 IB::GetDesc                       B
+
+# ---------------------------------------------------------------- meta records (no `this`)
+# SHOT: frame, width, height, scale (downscale factor), source back-buffer format, RGBA8 pixels (w*h*4, top row first)
+192 Meta::Shot                        uuuudB
+# DESTROY: a wrapped object's real refcount reached 0 (or its container died)
+193 Meta::Destroy                     u
+# EVENT: free text (warnings, stats, first-chance exceptions)
+194 Meta::Event                       s
+# END: frames, total calls (written on device release, DLL unload and crash flush)
+195 Meta::End                         uu
+# OBJECT: an object handed out that the recorder does not wrap (cube/volume textures, swap chains): id 0 in records
+196 Meta::Unwrapped                   ds
+# CREATE: Direct3DCreate8(sdkVersion) returned the IDirect3D8 with this id
+197 Meta::Create                      uu
+# HR prefix: the NEXT record's call returned this HRESULT (only written when it is not S_OK)
+240 Meta::HR                          d

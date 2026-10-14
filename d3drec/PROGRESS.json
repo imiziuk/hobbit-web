@@ -1,0 +1,26 @@
+{
+  "updated": "2026-10-14T00:57:50-07:00",
+  "phase": "Complete: built and verified offline; awaiting a recording session with the user's permission",
+  "done": [
+    "d3d8.dll proxy (x86, static CRT, only KERNEL32 import) wrapping IDirect3D8, Device8, Texture8, Surface8, VB8, IB8: every method",
+    "binary .d3dr format: LZ4 chunks on a writer thread, blob dedupe, VB/IB diff spans, matrix cache, HR prefix, crash flush (vectored handler, CONTINUE_SEARCH)",
+    "screenshots before Present: auto = lockable back buffer, else render-target copy, else sysmem copy (d3d8to9 lacks d3dx9_43 on this laptop)",
+    "mock_d3d8.dll + synth.exe offline test: 21/21 round-trip checks x 3 configs pass",
+    "replay.html + replayer.js drive web/d3d8/d3d8.js; headless Chrome: 4/4 synthetic replay runs pass (pixel-exact, sabotaged frame found exactly)",
+    "install.ps1 / uninstall.ps1 tested on a fake folder; refuse Clean/Reference",
+    "bench: 0.35 ms/frame recorder overhead at ~4,500 calls/frame",
+    "docs/D3DREC.md written (format, config, numbers, session steps)"
+  ],
+  "next": [
+    "later session (with permission): install.ps1 into a hard-link copy, menu smoke test by the play-tester agent, ~20 min recording, replay.html diff"
+  ],
+  "numbers": {
+    "methods_wrapped": 171,
+    "methods_needed": 48,
+    "dll_builds": true,
+    "synthetic_replay_tests_pass": 4,
+    "synthetic_replay_tests_total": 4,
+    "est_log_mb_per_20min": 790
+  },
+  "notes": "methods_needed = 37 device + 11 IDirect3D8 methods from the inventory (plus the resource lock paths); all 171 vtable methods of the six interfaces are wrapped. Size estimate is from a modelled frame (bench.exe), not the real game. Game never launched. Finding: the folder d3d8to9 needs d3dx9_43.dll (not installed), so CopyRects into non-DEFAULT surfaces fails, likely including the game's own screen grabs."
+}

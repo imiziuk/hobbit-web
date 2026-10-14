@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hobbit Recompiled</title>
+<style>
+  :root { --bg: #111; --fg: #ddd; --muted: #888; --panel: #1b1b1b; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.4 system-ui, sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 12px 16px; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  #screen { display: block; width: 100%; max-width: 640px; aspect-ratio: 4 / 3; background: #000; image-rendering: pixelated; outline: none; }
+  #stat { color: var(--muted); margin: 6px 0; font-family: ui-monospace, monospace; font-size: 12px; }
+  #log { background: var(--panel); height: 260px; overflow: auto; margin: 0; padding: 8px; font: 11px/1.35 ui-monospace, monospace; white-space: pre-wrap; }
+  #snaps img { margin: 4px 4px 0 0; }
+  p.note { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>The Hobbit (2003), recompiled x86 → WebAssembly</h1>
+  <canvas id="screen" width="640" height="480" tabindex="0"></canvas>
+  <div id="stat">idle</div>
+  <div id="snaps"></div>
+  <pre id="log"></pre>
+  <p class="note">Runs recomp/out/hobbit_flat.wasm from the real entry point with JSPI green threads and the web/d3d8 WebGL2 device.
+    Game files are read with HTTP Range requests from recomp/serve_game.py (127.0.0.1:5191, read-only). Keyboard goes to DirectInput.</p>
+</main>
+<script type="module" src="game.mjs"></script>
+</body>
+</html>

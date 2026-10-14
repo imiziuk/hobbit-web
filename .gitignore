@@ -1,0 +1,15 @@
+recomp/out/
+.venv/
+tools/
+config.json
+__pycache__/
+d3drec/build/
+d3drec/node_modules/
+*.d3drec
+# never commit game files
+*.DFS
+*.000
+*.001
+*.bik
+*.exe
+*.dll

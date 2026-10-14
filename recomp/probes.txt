@@ -1,0 +1,5 @@
+# Function entries that notify the host in the flat game build (rt_probe; no effect on guest state).
+00650010 x_Log            # retail no-op logger ("Starting Main Loop"); shared by other "return 0" functions (ICF)
+004fe3e0 RunFrontEnd
+004fe5a0 LoadLevel
+0052ae30 PlayMovie

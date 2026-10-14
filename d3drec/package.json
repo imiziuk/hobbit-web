@@ -1,0 +1,6 @@
+{
+  "name": "d3drec",
+  "private": true,
+  "type": "module",
+  "description": "D3D8 call recorder tools: reader.js, dump.mjs, test/check_log.mjs, replay.html"
+}

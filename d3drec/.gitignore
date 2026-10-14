@@ -1,0 +1,4 @@
+build/
+node_modules/
+*.d3drec
+d3drec_logs/

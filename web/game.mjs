@@ -10,7 +10,10 @@ import { installMultiplayer } from '../recomp/host/mp.mjs';
 const q = new URLSearchParams(location.search);
 // game data server: ?data=..., else the host this page was opened from, on the next port (on this machine that is
 // 127.0.0.1:5191 as before)
-const DATA = q.get('data') || `${location.protocol}//${location.hostname || '127.0.0.1'}:${(+location.port || 80) + 1}`;
+// Over HTTPS (Tailscale serve in docker-compose.yml) the ports are 443 page / 8443 data / 10000 relay.
+const HTTPS = location.protocol === 'https:';
+const DATA = q.get('data') || (HTTPS ? `https://${location.hostname}:8443`
+  : `${location.protocol}//${location.hostname || '127.0.0.1'}:${(+location.port || 80) + 1}`);
 const snaps = (q.get('snap') || '').split(',').filter(Boolean).map(Number);
 const $ = id => document.getElementById(id);
 const logEl = $('log'), statEl = $('stat');
@@ -162,7 +165,8 @@ function setupMultiplayer(m, W) {
   const levelName = l => l === undefined || l < 0 ? 'menu' : (LEVELS[l] || 'level ' + l);
   const store = (k, v) => { try { if (v === undefined) return localStorage.getItem('hobbit.mp.' + k); localStorage.setItem('hobbit.mp.' + k, v); } catch { return null; } };
   const nameEl = $('mpName'), urlEl = $('mpUrl'), roomEl = $('mpRoom'), statusEl = $('mpStatus'), listEl = $('mpPlayers');
-  const defHost = `${location.hostname || '127.0.0.1'}:${(+location.port || (location.protocol === 'https:' ? 443 : 80)) + 2}`;
+  const defHost = location.protocol === 'https:' ? `wss://${location.hostname}:10000`
+    : `${location.hostname || '127.0.0.1'}:${(+location.port || 80) + 2}`;
   nameEl.value = q.get('name') || store('name') || 'Hobbit';
   urlEl.value = q.get('mp') || store('url') || defHost;
   roomEl.value = q.get('room') || store('room') || 'main';

@@ -82,43 +82,42 @@ other. Remote players are the fake-Bilbo NPCs of **The Hobbit Synchrony v3**
 into `cache/` and served as virtual archives; nothing is written to the game folder. Details and what is not synced
 yet: `docs/MULTIPLAYER.md`.
 
-## Run it in Docker
+## Run it in Docker (with its own Tailscale node)
 
 ```
 cp .env.example .env          # then set GAME_DIR to your game folder (the one with Meridian.exe)
 docker compose up -d --build
+docker logs hobbit-tailscale  # first start only: open the login link it prints to add the node to your tailnet
 ```
-Open **http://127.0.0.1:5190/web/game.html**. The first start translates and compiles the game, about 4 minutes
-(`docker logs -f hobbit-web`). The build lands in `recomp/out/` and is reused after that; if you already built it with
-`start.py`, it starts instantly.
+Two containers start:
+- **hobbit-web**: the game (page, game data and multiplayer relay). The first start translates and compiles the game,
+  about 4 minutes (`docker logs -f hobbit-web`). The build is kept in `recomp/out/`.
+- **hobbit-tailscale**: a separate Tailscale machine called **hobbit-web**. The game lives inside its network, so over
+  the network the game is reachable **only** through that node. Your PC, your other devices and your tailnet stay
+  private.
 
-What the container exposes:
+| Who | Address |
+|---|---|
+| you, on this PC | http://127.0.0.1:5190/web/game.html |
+| anyone you share the node with | https://hobbit-web.YOUR-TAILNET.ts.net/web/game.html |
 
-| Port | What | Reachable from |
-|---|---|---|
-| 5190 | the game page | this machine only |
-| 5191 | your game files, read-only | this machine only (never shared) |
-| 5192 | multiplayer relay | the network (LAN / Tailscale); set `RELAY_BIND` in `.env` to narrow it |
+On the Tailscale address, the page is on 443, the game data on 8443 and the relay on 10000, all HTTPS (real
+certificates via `tailscale serve`, see `tailscale/serve.json`). The page finds the data and relay addresses by itself.
+Your game folder is mounted read-only. The game files are streamed to the browsers that open the page, so share the node
+only with people who own the game.
 
-The game folder is mounted read-only, and the image contains no game files.
+## Play with a friend
 
-## Play with a friend over the internet (Tailscale)
+1. **Host:** run the containers as above and add the node (login link). In the Tailscale admin console → Machines →
+   **hobbit-web** (not your PC) → **Share…**, send the invite link. Shared users can reach only that machine.
+2. **Friend:** install Tailscale, accept the invite, and open
+   `https://hobbit-web.YOUR-TAILNET.ts.net/web/game.html?name=TheirName&room=main` in Chrome 137+. Nothing else
+   to install: the game streams from the host.
+3. **Host** plays at `http://127.0.0.1:5190/web/game.html?name=Ivan&room=main`.
+4. Both start a New Game (Enter skips the movie and the cutscene) and meet in Dream World. The panel lists the players.
 
-Every player runs their **own** copy, with their own game files, through Docker or `start.py`. Only the relay of one
-player, the host, is shared. Steps:
-
-1. **Host:** run the container (above), or `python start.py --mp --lan`.
-2. **Network:** both install [Tailscale](https://tailscale.com). The host shares their machine with the friend:
-   Tailscale admin console → Machines → *your PC* → **Share** → send the invite link. The friend accepts it. The host's
-   Tailscale IP (100.x.y.z) is shown in the Tailscale app. On the same LAN you can use the LAN IP instead.
-3. **Friend:** clone this repo, put their own game folder in `.env`, and run `docker compose up -d --build`.
-4. **Both** open `http://127.0.0.1:5190/web/game.html?mp=<host Tailscale IP>:5192&name=<your name>&room=main`.
-   The host can use `mp=127.0.0.1:5192`. You can also type the address in the Multiplayer panel and press Connect.
-5. Start a New Game in the same level. The other player appears as a second Bilbo, and the panel lists everyone with
-   their level ("here" = same level as you).
-
-The relay has no password, so share it only through Tailscale or a trusted LAN, not as an open internet port. Both
-copies should be the verified retail version: `start.py` warns if `Meridian.exe` differs.
+Without Docker: `python start.py --mp` plays locally. A friend with their own copy can run it too and connect to the
+host's relay by typing its address in the Multiplayer panel.
 
 ## How it works
 

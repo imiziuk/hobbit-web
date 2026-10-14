@@ -289,8 +289,7 @@ def serve(game, port, open_browser, mp=False, lan=False):
     say(f"PLAY: {url}   (Chrome/Edge 137+; Ctrl+C here to stop)")
     if lan and os.environ.get("HOBBIT_IN_DOCKER"):
         say(f"in Docker: open http://127.0.0.1:{port}/web/game.html on this machine")
-        if mp:
-            say(f"  multiplayer: friends put <this machine's LAN or Tailscale IP>:{port + 2} in the Server field (or ?mp=IP:{port + 2})")
+        say("  friends (Tailscale node 'hobbit-web', see docker-compose.yml): https://hobbit-web.<your-tailnet>.ts.net/web/game.html")
         lan = False
     if lan:
         for ip in local_ips():

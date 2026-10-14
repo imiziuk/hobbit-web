@@ -1,22 +1,47 @@
-# docker compose up --build        (first start translates + compiles the game: ~4 minutes, then cached)
-# Set GAME_DIR in .env (see .env.example) to the folder that holds Meridian.exe and the .DFS archives.
+# docker compose up -d --build     (first start translates + compiles the game: ~4 minutes, then cached)
+# .env: GAME_DIR = your game folder (see .env.example).
+#
+# Networking: the game runs inside the network of its own Tailscale node "hobbit-web". Friends reach ONLY that node
+# (share just this machine from the Tailscale admin console); your PC and other devices stay private.
+#   on this PC:      http://127.0.0.1:5190/web/game.html
+#   over Tailscale:  https://hobbit-web.<your-tailnet>.ts.net/web/game.html   (page 443, game data 8443, relay 10000)
+# First start without TS_AUTHKEY: `docker logs hobbit-tailscale` prints a login link; open it once to add the node.
 services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    container_name: hobbit-tailscale
+    hostname: hobbit-web
+    restart: unless-stopped
+    environment:
+      - TS_HOSTNAME=hobbit-web
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=true                  # no kernel module / extra privileges needed
+      - TS_AUTHKEY=${TS_AUTHKEY:-}         # optional; empty = log in with the link from the logs
+      - TS_SERVE_CONFIG=/config/serve.json # HTTPS on the tailnet name -> the game's ports
+    volumes:
+      - ts-state:/var/lib/tailscale
+      - ./tailscale/serve.json:/config/serve.json:ro
+    ports:                                 # local access for you (this PC only)
+      - "127.0.0.1:5190:5190"
+      - "127.0.0.1:5191:5191"
+      - "127.0.0.1:5192:5192"
+
   hobbit:
     build: .
     image: hobbit-web
     container_name: hobbit-web
     restart: unless-stopped
+    network_mode: service:tailscale        # share the Tailscale node's network: no ports of its own
+    depends_on: [tailscale]
     volumes:
       - "${GAME_DIR:?set GAME_DIR in .env to your game folder}:/game:ro"   # read-only: nothing is ever written there
-      - ./recomp/out:/app/recomp/out          # the translated game build (reused if you already built it)
+      - ./recomp/out:/app/recomp/out       # the translated game build (reused if you already built it)
       - tools:/app/tools
       - venv:/app/.venv
       - cache:/app/cache
-    ports:
-      - "127.0.0.1:5190:5190"      # the game page: this machine only
-      - "127.0.0.1:5191:5191"      # your game files: this machine only (never share them)
-      - "${RELAY_BIND:-0.0.0.0}:5192:5192"   # multiplayer relay: reachable by friends (LAN / Tailscale)
+
 volumes:
+  ts-state:
   tools:
   venv:
   cache:

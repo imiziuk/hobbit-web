@@ -59,7 +59,15 @@ Storage (secure pages only: `https://` or `127.0.0.1` / `localhost`). Measured (
 | to the main menu | 170 requests, 20.3 MB | 14 requests, 7 KB |
 | into Dream World | ~580 requests, ~49 MB | 14 requests, 7 KB (0 game-data requests) |
 
-To free the space: DevTools > Application > Storage > Clear site data (the cache is called `hobbit-data-v1`).
+**Game data panel** (under the game): **Download game data in background** (on by default, remembered) fetches the
+files you will need next in large requests while you are in the menu or playing: the level being loaded, common
+data, Dream World, all the sound (audio1/audio2) and the next level, about **850 MB**. It gives way to the game's
+own reads, uses about half the link while a level is running, and stays off with Data Saver or on a 2G connection.
+**Download everything for offline** fetches the rest too: **1.2 GB** in total (all levels; the movies are not needed,
+the port only reads their headers). It continues on the next visit until it is complete. **Clear downloaded data**
+deletes it again (it is downloaded again when needed). Without this, a first visit to a remote server stalls on
+every small read (measured with 80 ms latency: Dream World took 46 s to load instead of 17 s).
+Space is also freed by DevTools > Application > Storage > Clear site data (the cache is called `hobbit-data-v1`).
 
 ### Controls
 
@@ -180,7 +188,8 @@ login. Keep the Access policy to an email allow-list, and turn the tunnel off wh
    type the PIN they get, and play. Multiplayer connects to `/relay` on the same name by itself.
 
 **Bandwidth per friend** (measured, see the Traffic table above): about 20 MB to the main menu and ~49 MB into Dream
-World on the first visit; later visits ~7 KB plus whatever new parts of the game they reach (game data is kept in
+World on the first visit, plus up to ~850 MB more in the background over the next minutes while "Download game data
+in background" is on (1.2 GB with "Download everything"); later visits ~7 KB plus whatever new parts of the game they reach (game data is kept in
 the browser, keyed by the file's size and date, so it is only fetched again when your game files change). Cloudflare
 does not cache the game data by default (.DFS archives read with Range requests), so every first visit is served by your PC
 through the tunnel.
@@ -226,7 +235,7 @@ Docs: `docs/RECOMP.md` (translator), `docs/RECOMP_BOOT.md` (boot, host layer, ru
 | `start.py`, `start.bat` | launcher (setup, build, servers; `--single` = one-port server) |
 | `docker-compose.yml`, `Dockerfile`, `.env.example`, `tailscale/` | Docker: game + Tailscale node, optional `cloudflared` (profile `cloudflare`) |
 | `recomp/` | translator (`cfg.py`, `x86c.py`), `build.py`, C runtime, JS host layer, headless Node runner `boot_node.mjs`, capsule harness |
-| `web/` | `game.html` / `game.mjs` (the game page), `touch.mjs` (phone controls), `audio.mjs` + `audio-worklet.js` (DirectSound output), `d3d8/` (Direct3D 8 on WebGL2 + its self-test `d3d8/test.html`) |
+| `web/` | `game.html` / `game.mjs` (the game page), `touch.mjs` (phone controls), `audio.mjs` + `audio-worklet.js` (DirectSound output), `prefetch.mjs` (background download of the game data), `d3d8/` (Direct3D 8 on WebGL2 + its self-test `d3d8/test.html`) |
 | `auto/` | function boundaries, ABI table and cross-references for this exact exe (from the Ghidra analysis) |
 | `d3drec/` | proxy `d3d8.dll` that records the original game's D3D calls + a Chrome replayer that diffs the frames |
 

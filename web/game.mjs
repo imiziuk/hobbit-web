@@ -8,6 +8,7 @@ import * as com from './d3d8/com.js';
 import { installMultiplayer } from '../recomp/host/mp.mjs';
 import { installTouch, mergePads } from './touch.mjs';
 import { createAudio } from './audio.mjs';
+import { createPrefetch } from './prefetch.mjs';
 
 const q = new URLSearchParams(location.search);
 // Where the game data and the relay are. ?data= / ?mp= always win. Otherwise:
@@ -115,7 +116,9 @@ async function main() {
   // Meridian.exe is read through the HttpBackend like every other game file, so it comes from the persistent block
   // cache on later visits (recomp/host/vfs.mjs)
   const manifestP = fetch(DATA + '/__manifest').then(r => { if (!r.ok) throw new Error('game server: ' + r.status); return r.json(); });
-  const httpBeP = manifestP.then(mf => new HttpBackend(DATA, mf));
+  // ?readahead=N (blocks, 0 = off) and ?prefetch=0|bg|all are for tests; the page setting is remembered otherwise
+  const ra = q.get('readahead');
+  const httpBeP = manifestP.then(mf => new HttpBackend(DATA, mf, ra !== null ? { readAhead: +ra } : {}));
   const [module, exe, manifest, httpBe, funcsTxt] = await Promise.all([
     WebAssembly.compileStreaming(fetch('../recomp/out/hobbit_flat.wasm')),
     httpBeP.then(be => {
@@ -134,7 +137,7 @@ async function main() {
   const m = new Machine({ wasm: module, exe, clock: new RealClock(), log });
   await m.init();
   const vfs = new VFS(httpBe, new MemBackend());
-  window.hobbit.http = httpBe;
+  window.hobbit.http = httpBe; httpBe.who = () => (m.cur ? m.cur.name : '');
   const W = new Win32(m, vfs, { onDebug: s => log('[dbg] ' + s.replace(/\s+$/, '')), knownDlls: ['shfolder.dll'] });
   const S = W.table();
   installDirectInput(m, W, S); installDirectSound(m, W, S, audio.backend); audio.attach(W.ds);
@@ -154,7 +157,49 @@ async function main() {
   const MS = [[0x004fd630, 'WinMain'], [0x004fdb90, 'EngineInit'], [0x004fb310, 'LegalScreen'], [0x0052ae30, 'PlayMovie'], [0x004fe3e0, 'RunFrontEnd'], [0x0051e860, 'PressStart']];
   const reached = new Set();
   let fpsT = performance.now(), fpsN = 0, fps = 0;
+  // diagnostics (hobbit.diag()): frame times, blocking reads (vfs.mjs), stream underruns (dx.mjs DS.diag), late mixer commands
+  const D = window.hobbit.D = { t0: performance.now(), lastP: 0, long: [], frames: [], marks: [] };
+  setInterval(() => W.ds && W.ds.check(), 20);
+  window.hobbit.mark = name => D.marks.push([+((performance.now() - D.t0) / 1000).toFixed(2), name]);
+  window.hobbit.diag = (since = 0) => {
+    const ds = W.ds.diag, sec = t => +((t - D.t0) / 1000).toFixed(2);
+    const fr = D.frames.filter(f => f[0] >= since), iv = fr.map(f => f[1]).sort((a, b) => a - b);
+    const tr = httpBe.trace.filter(r => r[0] >= since);
+    return {
+      now: sec(performance.now()), presents: W.frames, marks: D.marks,
+      frames: fr.length, p50: iv[iv.length >> 1] | 0, p95: iv[Math.floor(iv.length * 0.95)] | 0, max: iv[iv.length - 1] | 0,
+      longFrames: D.long.filter(f => f[0] >= since).slice(0, 40),
+      http: { req: httpBe.fetches, MB: +(httpBe.bytes / 1e6).toFixed(1), storeHits: httpBe.storeHits, waits: tr.length,
+        netWaits: tr.filter(r => r[5]).length, waitMs: Math.round(tr.reduce((a, r) => a + r[4], 0)),
+        slow: tr.filter(r => r[4] > 50).slice(0, 30) },
+      audio: { state: audio.state, kind: audio.kind, plays: W.ds.plays, short: ds.short || 0, stale: ds.stale, torn: ds.torn, staleEv: ds.events.filter(e => e[0] >= 0).slice(-30),
+        late: audio.stats.late, lateMs: audio.stats.lateMs, playback: (ps => ps ? Object.fromEntries(['underrunEvents', 'underrunDuration', 'totalDuration', 'averageLatency', 'maximumLatency'].map(k => [k, ps[k]])) : null)(audio.ctx && audio.ctx.playbackStats) },
+    };
+  };
+  // test driver: menu -> New Game -> skip the movie -> mark 'runlevel' when the level starts (needs the menu to come up)
+  window.hobbit.autoNewGame = async () => {
+    const w = ms => new Promise(r => setTimeout(r, ms));
+    while (window.hobbit.feState !== 6) await w(200);
+    window.hobbit.mark('menu'); await w(1500);
+    window.hobbit.press('Enter'); await w(4000);
+    window.hobbit.press('Enter'); window.hobbit.mark('skip');
+    while (!lines.some(l => l.includes('Calling RunLevel'))) await w(100);
+    window.hobbit.mark('runlevel');
+  };
+  // summary of the first `sec` seconds after the level started (or after `from`)
+  window.hobbit.report = (sec = 20, from) => {
+    const mk = n => (D.marks.find(x => x[1] === n) || [])[0];
+    const R = from !== undefined ? from : mk('runlevel'), fr = D.frames.filter(f => f[0] >= R && f[0] <= R + sec);
+    const ms = fr.map(f => f[1]).sort((a, b) => a - b), tr = httpBe.trace.filter(r => r[0] >= R && r[0] <= R + sec), d = window.hobbit.diag(R);
+    return { load: +(R - mk('skip')).toFixed(1), fps: +(fr.length / sec).toFixed(1), p95: ms[Math.floor(ms.length * 0.95)], maxFrame: ms[ms.length - 1],
+      frozenMs: fr.filter(f => f[1] > 100).reduce((a, f) => a + f[1], 0), gameWaits: tr.length, gameWaitMs: Math.round(tr.reduce((a, r) => a + r[4], 0)),
+      netWaits: tr.filter(r => r[5]).length, audio: d.audio, http: { req: httpBe.fetches, MB: +(httpBe.bytes / 1e6).toFixed(1), storeHits: httpBe.storeHits } };
+  };
   W.onPresent = n => {
+    { const now = performance.now(), dt = D.lastP ? now - D.lastP : 0; D.lastP = now;
+      const t = +((now - D.t0) / 1000).toFixed(2);
+      if (D.frames.length < 100000) D.frames.push([t, Math.round(dt)]);
+      if (dt > 100 && D.long.length < 2000) D.long.push([t, Math.round(dt), n]); }
     for (const [a, name] of MS) if (!reached.has(a) && m.r8(visAt + ordinal.get(a))) { reached.add(a); log(`== reached ${name} at Present ${n}`); }
     fpsN++; const now = performance.now(); if (now - fpsT > 1000) { fps = fpsN * 1000 / (now - fpsT); fpsN = 0; fpsT = now; }
     if (n % 10 === 0) statEl.textContent = `Present ${n} | ${fps.toFixed(1)} fps | FE state ${m.r32(0x762b58)} | ` +
@@ -269,6 +314,7 @@ async function main() {
   window.hobbit.press = (code, ms = 150) => { const k = DIK[code]; keys[k] = 0x80; setTimeout(() => { keys[k] = 0; }, ms); };
   window.hobbit.m = m; window.hobbit.W = W;
 
+  setupPrefetch(httpBe);
   log(`starting at entry ${hex(m.pe.entry)}`);
   try {
     const r = await m.startMain(m.pe.entry);
@@ -280,6 +326,37 @@ async function main() {
     statEl.textContent += ' | STOPPED';
   }
 }
+// "Game data" panel: background download into the block store (web/prefetch.mjs). localStorage hobbit.prefetch =
+// '1' (default) | '0'; hobbit.offline = '1' while "Download everything" has not finished (it resumes on the next visit).
+function setupPrefetch(be) {
+  const ls = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { return null; } };
+  const bg = $('dlBg'), bar = $('dlBar'), txt = $('dlText'), all = $('dlAll'), clr = $('dlClear');
+  const mb = n => (n / 1e6).toFixed(0);
+  const render = P => {
+    const off = P.mode === 'all' || ls('hobbit.offline') === '1';
+    const d = off ? P.done : P.bgDone, t = off ? P.total : P.bgTotal;
+    bar.max = Math.max(1, t); bar.value = d;
+    txt.textContent = `${mb(d)} / ${mb(t)} MB ${off ? '(everything)' : '(current + next level, sound)'}` +
+      (P.state === 'downloading' ? ` | ${(P.rate * 8 / 1e6).toFixed(1)} Mbit/s` : P.state !== 'idle' ? ` | ${P.state}` : '') +
+      (P.reason ? ` (${P.reason})` : '') + (off ? '' : ` | all: ${mb(P.done)} / ${mb(P.total)} MB`);
+    all.disabled = P.mode === 'all';
+    if (P.mode === 'all' && P.state === 'complete') { ls('hobbit.offline', '0'); P.setMode(bg.checked ? 'bg' : 'off'); }
+  };
+  let last = 0;
+  const P = createPrefetch(be, { log, playing: () => !!(window.hobbit.W && window.hobbit.W.input.padMode && window.hobbit.W.input.padMode() !== 'menu'), onChange: p => { const now = performance.now(); if (now - last > 250 || p.state !== 'downloading') { last = now; render(p); } } });
+  window.hobbit.prefetch = P;
+  const qp = q.get('prefetch');
+  const saved = ls('hobbit.prefetch');
+  bg.checked = qp ? qp !== '0' : saved !== '0';
+  const mode = () => (ls('hobbit.offline') === '1' ? 'all' : bg.checked ? 'bg' : 'off');
+  bg.addEventListener('change', () => { ls('hobbit.prefetch', bg.checked ? '1' : '0'); if (P.mode !== 'all') P.setMode(mode()); });
+  all.onclick = () => { ls('hobbit.offline', '1'); P.setMode('all'); };
+  clr.onclick = () => { if (confirm('Delete the downloaded game data from this browser? It is downloaded again when needed.')) { ls('hobbit.offline', '0'); P.clear(); } };
+  P.setMode(qp === 'all' ? 'all' : qp === '0' ? 'off' : mode());
+  if (P.mode === 'off') P.scan();
+  setInterval(() => render(P), 1000);
+}
+
 // multiplayer panel (recomp/host/mp.mjs; relay = recomp/mp_relay.py, default port = this page's port + 2)
 // URL: ?mp=host:port&name=Bilbo&room=main connects automatically.
 function setupMultiplayer(m, W) {

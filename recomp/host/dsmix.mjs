@@ -19,10 +19,12 @@ export class DsMixer {
     this.sr = sampleRate; this.frame = 0; this.data = new Map(); this.voices = new Map(); this.queue = [];
     this.master = 1;
     this.stats = { peak: 0, sumsq: 0, n: 0 };     // reset by the reader
+    this.late = 0; this.lateMax = 0;               // timed commands that arrived after their frame (cumulative)
   }
   post(c) {
     if (c.at !== undefined) {
-      const f = Math.max(this.frame, Math.round(c.at * this.sr));
+      const want = Math.round(c.at * this.sr), f = Math.max(this.frame, want);
+      if (want < this.frame) { this.late++; if (this.frame - want > this.lateMax) this.lateMax = this.frame - want; }
       c.frame = f;
       let i = this.queue.length;                 // keep sorted by frame, stable
       while (i > 0 && this.queue[i - 1].frame > f) i--;

@@ -28,7 +28,7 @@ was loaded. The menu text is the game's own bitmap font (section 6), not D3DXFon
 | `recomp/host/pe.mjs` | PE sections + import directory |
 | `recomp/host/win32.mjs` | KERNEL32/USER32/GDI32/SHELL32/WINMM/binkw32/shfolder shims, MSLU W functions, fake DLL images, message queue, SEH |
 | `recomp/host/dx.mjs` | DirectInput8 + DirectSound8 host COM objects (sound: `dsmix.mjs` mixer, `web/audio.mjs` + `web/audio-worklet.js`); D3D8 via `web/d3d8/com.js` ComBridge; `nullGL()` for Node |
-| `recomp/host/vfs.mjs`, `node_fs.mjs` | path mapping (`C:\HOBBIT` = game folder read-only, `C:\APPDATA` = settings), Node fs backend, HTTP Range backend (64 KB blocks: memory cache, then the persistent Cache API store `hobbit-data-v1` keyed by file + manifest version + size, then one Range request per run of missing blocks; no store in Node), memory backend |
+| `recomp/host/vfs.mjs`, `node_fs.mjs` | path mapping (`C:\HOBBIT` = game folder read-only, `C:\APPDATA` = settings), Node fs backend, HTTP Range backend (64 KB blocks: memory cache, blocks in flight, then the persistent Cache API store `hobbit-data-v1` keyed by file + manifest version + size, then one Range request per run of missing blocks; sequential read-ahead; no store in Node), memory backend. `web/prefetch.mjs` downloads into the same store in the background (see the last section) |
 | `recomp/boot_node.mjs` | headless runner; writes `recomp/out/boot/{boot.log, summary.json, files.txt, entered.txt}` |
 | `recomp/serve_game.py` | read-only Range + CORS server for the game folder on 127.0.0.1:5191, `/__manifest` (`[path, size, version]`), ETag on every response, `?v=` URLs immutable (launch.json `hobbit-game-data`); `serve_path()` is reused by `start.py --single` under `/data/` |
 | `web/game.html`, `web/game.mjs` | Chrome page (served by `hobbit-web`, port 5190): JSPI, real d3d8.js device on the canvas, keyboard/mouse -> DirectInput, `?snap=20,90` keeps frames as images |
@@ -211,3 +211,72 @@ digital silence 0.02 ms = no stream gaps), 2-14 voices playing; `node_menu.wav` 
 
 Known gaps: Bink audio; no DS3D (the game does not use it); sound names are not shown (the voice -> AUDIOPKG
 descriptor link is not mapped); clipping is hard (as DirectSound).
+
+## Glitchy sound on a first visit: diagnosis, GetStatus fix, read-ahead + background prefetch (Oct 14, evening)
+Report: the first seconds sounded glitchy on a first visit over Cloudflare/Tailscale. Measured in the browser pane
+against `start.py --single --throttle MS:MBIT` (dev option, also `recomp/serve_game.py --throttle` / env
+`HOBBIT_THROTTLE`: every data response waits MS before its headers, all bodies share MBIT; launch.json
+`hobbit-throttle` 5490 = 80:20, `hobbit-throttle-slow` 5491 = 200:10, `hobbit-local` 5590 = none). Cold = Cache
+Storage cleared. Test driver in the page: `hobbit.autoNewGame()` (menu -> New Game -> skip movie -> mark `runlevel`),
+then `hobbit.report(20)` = the first 20 s of Dream World; `hobbit.diag()` has the raw numbers.
+
+**Instruments.** `vfs.mjs`: every game read that has to wait (`trace`: time, file, offset, size, ms, blocks from the
+network / store, thread). `dx.mjs` `DS.diag`: per 4 KB chunk of every looping buffer the lap its last write was meant
+for, so replaying old data = `stale` (the game refilled too late), `torn` = writes into the chunk being played,
+`short` = sounds stopped/released < 100 ms after Play, `log` = Play/Stop/SetCurrentPosition/Release/Unlock of
+buffers >= 128 KB. Mixer (`dsmix.mjs`): `late` = timed commands that arrived after their frame. Chrome's
+`AudioContext.playbackStats` (worklet underruns). Page: frame times (`hobbit.D.frames`, long frames).
+
+**Findings.**
+1. The audio output itself never starved: `playbackStats.underrunEvents` 0, `late` 0, `stale` 0, `torn` 0 in every run
+   (cold, warm, 80 ms, 200 ms). Streams are 0x40000-byte buffers (two halves of 2 s at 32 kHz, 6 s at 11 kHz) and
+   were always refilled in time; the 50 ms lead was never too short (CPU-heavy frames only delay when commands are
+   issued, they are stamped `now + lead` at that moment).
+2. **A port bug clipped most sounds** (also with a warm cache, worse on a cold one): state changes take effect at
+   `now + 50 ms`, but `GetStatus` answered for `now`, so a buffer polled in the frame after its `Play` read "stopped"
+   and the game stopped and released it after one frame (30-40 ms blips; the log showed big buffers playing 0.03 s).
+   Warm: 378 of 593 plays clipped (64 %); cold 80 ms: 404 of 529 (76 %). Fix: `GetStatus` reports the state of the
+   last command while it is still pending (real DirectSound applies Play/Stop at once). After: 30 of 478 (6 %) warm,
+   21 of 379 cold; what is left are sounds the game itself stops early.
+3. **Network round trips stalled the game.** All file reads come from the io thread (thread@00676f60) in serial
+   32 KB `ReadFile` calls, and the main thread waits for that io: ~115 ms per 32 KB at 80 ms latency (0.3 MB/s).
+   Cold 80:20: Dream World load 46.4 s, then in the first 20 s 52 blocking network reads (6.4 s), one 3.9 s freeze;
+   200:10: load 100 s, an 8.5 s freeze in the first seconds of the level. Warm: load 1.5 s, 0 network reads.
+
+**Fixes.**
+- `dx.mjs` GetStatus (above).
+- `vfs.mjs` HttpBackend: **read-ahead** for sequential reads (2, 4 .. 16 blocks = 1 MB, fetched in the background);
+  **claims**: every block a reader looks up is registered in `inflight` synchronously, so the game, read-ahead and
+  the prefetcher never download a block twice (measured: 1211.4 MB fetched for the 1211 MB set); bodies are read as a
+  stream and each 64 KB block is handed out as soon as it is complete; `cache: 'no-store'` (the blocks live in Cache
+  Storage, Chrome's HTTP cache would keep a second copy). `gameWaiting`, `onOpen`, `onStored` hooks for the prefetcher.
+- `web/prefetch.mjs` (new): background download into the same Cache Storage blocks. The game comes first: while a
+  game read waits, only the file it is reading is prefetched (1 request, <= 512 KB); idle: 2 requests of ~250 ms of
+  transfer (256 KB-2 MB, from the measured throughput); while a level is played: 1 request then a pause as long as it
+  took (prefetching at full speed cost ~10 % fps: 17.6 vs 19.2). Order: the archive the game opened last, the DFS
+  headers, Dream World (still in the menu), common, boot, audio2, audio1, the next level; "everything" adds the other
+  levels, small files and the first 128 KB of each Bink movie (movies are stubbed, only headers are read). Off with
+  Save-Data or 2G, backs off 60 s below 64 KB/s, resumes from a one-time listing of the store (18,511 blocks in 336 ms).
+  Sizes: background set 848 MB (811 MB while in the menu), everything 1,211 MB (of the 2.7 GB folder: no movies,
+  logs, dlls).
+- Page "Game data" panel: "Download game data in background" (default on, `localStorage hobbit.prefetch`),
+  "Download everything for offline" (progress bar MB done / total; `hobbit.offline` = resume on the next visit until
+  complete; asks for persistent storage), "Clear downloaded data". Test URL options: `?prefetch=0|bg|all`,
+  `?readahead=N` (0 = off).
+
+**Before / after** (80 ms + 20 Mbit, cold, first 20 s of Dream World, browser pane):
+
+| | before (no read-ahead, no prefetch, old GetStatus) | after |
+|---|---|---|
+| menu reached | 25.0 s | 17.0 s |
+| Dream World load (skip -> RunLevel) | 46.4 s | 16.8 s |
+| blocking game reads / time waiting / from the network | 52 / 6.4 s / 52 | 23 / 2.0 s / 10 |
+| longest frame | 3,863 ms | 512 ms |
+| fps (pane; warm reference 21-24) | 18.6 | 20.9 |
+| clipped sounds | 404 of 529 | 21 of 379 |
+| worklet underruns / stale stream chunks | 0 / 0 | 0 / 0 |
+| data downloaded by then | 44 MB | 110 MB (prefetch keeps going at ~5 Mbit while playing) |
+
+Warm visit (prefetch on or off): load 1.3-1.6 s, 0-2 data requests (new sound samples only); after the full
+download 0 requests. Unthrottled local server: the 848 MB background set is complete about 35 s after the page
+opens, load unchanged (1.6 s). Node (`boot_node.mjs --frames 600`) unchanged: no Cache Storage, no prefetch.

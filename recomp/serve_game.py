@@ -6,7 +6,7 @@ Binds 127.0.0.1 only. Nothing is ever written; the data is not copied anywhere.
 GET /__manifest -> {"files": [["Common/i18n.txt", size, version], ...]}
 Data responses carry an ETag; URLs with ?v=<version> are served as immutable (Cache-Control max-age 1 year).
 """
-import argparse, json, os, re, sys, urllib.parse
+import argparse, json, os, re, sys, threading, time, urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -14,9 +14,44 @@ DEFAULT_ROOT = os.environ.get("HOBBIT_GAME_DIR") or os.path.normpath(os.path.joi
 SKIP = re.compile(r"(^|/)(shadow_fail[^/]*|\.git)(/|$)|\.log$|\.dll\.", re.I)
 
 
+class Throttle:
+    """Dev option: emulate a remote server (Cloudflare / Tailscale). Every data response waits `latency_ms` before its
+    headers, and all bodies share one `mbit`-per-second budget (token bucket). Off unless --throttle or
+    HOBBIT_THROTTLE="latency_ms:mbit" is given. The manifest and static files are not throttled."""
+    def __init__(self, spec):
+        lat, _, mbit = spec.partition(":")
+        self.latency = float(lat or 0) / 1000.0
+        self.rate = float(mbit or 0) * 1e6 / 8          # bytes per second; 0 = unlimited
+        self.lock = threading.Lock()
+        self.next = 0.0                                 # time when the shared link is free again
+
+    def wait_latency(self):
+        if self.latency:
+            time.sleep(self.latency)
+
+    def send(self, wfile, data):
+        if not self.rate:
+            wfile.write(data)
+            return
+        for i in range(0, len(data), 16384):
+            part = data[i:i + 16384]
+            with self.lock:
+                now = time.monotonic()
+                start = max(now, self.next)
+                self.next = start + len(part) / self.rate
+            delay = self.next - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            wfile.write(part)
+
+    def __str__(self):
+        return "%d ms per request, %s" % (self.latency * 1000, ("%.0f Mbit/s" % (self.rate * 8 / 1e6)) if self.rate else "no bandwidth cap")
+
+
 class Handler(BaseHTTPRequestHandler):
     root = DEFAULT_ROOT
     manifest = None
+    throttle = Throttle(os.environ["HOBBIT_THROTTLE"]) if os.environ.get("HOBBIT_THROTTLE") else None
     overlay = {}          # {relative path (lower case): virtual file with .size and .read(lo, n)} from mp_assets.py
 
     def log_message(self, fmt, *args):
@@ -113,6 +148,9 @@ def serve_path(h, path, head):
             h.send_header("Content-Length", "0")
             h.end_headers()
             return
+    th = Handler.throttle
+    if th:
+        th.wait_latency()
     h.send_response(206 if partial else 200)
     h.cors()
     h.send_header("Content-Type", "application/octet-stream")
@@ -125,8 +163,9 @@ def serve_path(h, path, head):
     h.end_headers()
     if head:
         return
+    write = th.send if th else (lambda w, d: w.write(d))
     if virt:
-        h.wfile.write(virt.read(lo, hi - lo + 1))
+        write(h.wfile, virt.read(lo, hi - lo + 1))
         return
     with open(full, "rb") as f:
         f.seek(lo)
@@ -135,7 +174,7 @@ def serve_path(h, path, head):
             chunk = f.read(min(left, 1 << 20))
             if not chunk:
                 break
-            h.wfile.write(chunk)
+            write(h.wfile, chunk)
             left -= len(chunk)
 
 
@@ -156,8 +195,13 @@ def main():
     ap.add_argument("--port", type=int, default=5191)
     ap.add_argument("--root", default=DEFAULT_ROOT)
     ap.add_argument("--mp", action="store_true", help="serve virtual archives with the multiplayer (Synchrony) assets")
+    ap.add_argument("--throttle", metavar="MS:MBIT", help="dev: emulate a remote server, e.g. 80:20 = 80 ms per request, 20 Mbit/s")
     a = ap.parse_args()
     Handler.root = os.path.normpath(os.path.abspath(a.root))
+    if a.throttle:
+        Handler.throttle = Throttle(a.throttle)
+    if Handler.throttle:
+        print("throttled: %s" % Handler.throttle, flush=True)
     if a.mp:
         enable_mp(Handler.root)
     srv = ThreadingHTTPServer(("127.0.0.1", a.port), Handler)

@@ -170,6 +170,42 @@ export function installDirectInput(m, W, S) {
 export function installDirectSound(m, W, S, out) {
   const be = out || { now: () => m.clock.now() / 1000, lead: 0, post() {} };
   const DS = W.ds = { buffers: new Set(), created: 0, plays: 0 };
+  // Stream diagnostics (looping buffers = the game's streams): every 4 KB chunk remembers which lap of the play cursor
+  // its last write was meant for. When the cursor enters a chunk on a later lap than that, the mixer is replaying old
+  // data = an audible underrun (the game refilled too late). `torn` = a write into the chunk being played right now.
+  DS.diag = { stale: 0, torn: 0, events: [], log: [] };
+  // big buffers (streams, >= 128 KB): Play / Stop / SetCurrentPosition / Release with times, for stream-gap analysis
+  const dlog = (s, op, a) => { if (s.size >= 0x20000 && DS.diag.log.length < 20000) DS.diag.log.push([+be.now().toFixed(3), s.id, op, a]); };
+  const CH = 4096;
+  const tracked = s => !s.primary && s.size >= 8 * CH && s.size % CH === 0;
+  const check = (s, t) => {
+    if (!s.wr) return;
+    const g = segAt(s, t);
+    if (!g.rate || !g.loop) { s.ck = null; return; }
+    const A = rawPos(s, t), fresh = !s.ck || s.ck.g !== g;
+    let k = fresh ? Math.floor(g.c0 / CH) : Math.floor(s.ck.A / CH) + 1;
+    const k1 = Math.min(Math.floor(A / CH), k + 4096);
+    for (; k <= k1; k++) {
+      const abs = k * CH, c = (abs % s.size) / CH, lap = Math.floor(abs / s.size), w = s.wr[c];
+      if (w >= 0 && w < lap) {
+        DS.diag.stale++;
+        if (DS.diag.events.length < 2000) DS.diag.events.push([+t.toFixed(3), s.id, c, lap, w]);
+      }
+    }
+    s.ck = { g, A };
+  };
+  const noteWrite = (s, off, n) => {
+    if (!tracked(s)) return;
+    if (!s.wr) s.wr = new Float64Array(s.size / CH).fill(-1);
+    const t = be.now(); check(s, t);
+    const g = segAt(s, t), A = g.rate ? rawPos(s, t) : g.c0, Pm = A % s.size, lap = Math.floor(A / s.size);
+    for (let c = Math.floor(off / CH); c <= Math.floor((off + n - 1) / CH) && c < s.wr.length; c++) {
+      const cs = c * CH;
+      if (g.rate && Pm >= cs && Pm < cs + CH) { DS.diag.torn++; s.wr[c] = lap; }
+      else s.wr[c] = cs >= Pm ? lap : lap + 1;
+    }
+  };
+  DS.check = () => { const t = be.now(); for (const s of DS.buffers) check(s, t); };
   let nextId = 1;
   const segAt = (s, t) => { const g = s.segs; let i = g.length - 1; while (i > 0 && g[i].t0 > t) i--; return g[i]; };
   const rawPos = (s, t) => { const g = segAt(s, t); return g.rate ? g.c0 + Math.max(0, t - g.t0) * g.rate : g.c0; };
@@ -195,9 +231,11 @@ export function installDirectSound(m, W, S, out) {
     DS.buffers.add(st); DS.created++;
     return bufCls.create(st);
   };
+  // a sound stopped (or released) less than 100 ms after its Play: counted as a clipped sound
+  const ended = s => { if (s.playAt !== undefined) { if (T() - s.playAt < 0.1) DS.diag.short = (DS.diag.short || 0) + 1; s.playAt = undefined; } };
   const release = s => {
     if (--s.refs > 0) return s.refs;
-    if (s.dead) return 0; s.dead = true; s.refs = 0;
+    if (s.dead) return 0; s.dead = true; s.refs = 0; dlog(s, 'release', 0); ended(s);
     DS.buffers.delete(s); m.comObjs.delete(s.ptr);
     if (!s.primary) {
       const t = T();                       // after any Stop that is still pending in the mixer
@@ -223,7 +261,14 @@ export function installDirectSound(m, W, S, out) {
     ['GetFormat', 3, (s, [p, n, pw]) => { if (p) m.u8.set(s.wfx.subarray(0, Math.min(18, n || 18)), p); if (pw) m.w32(pw, 18); return 0; }],
     ['GetVolume', 1, (s, [p]) => { m.w32(p, s.vol | 0); return 0; }], ['GetPan', 1, (s, [p]) => { m.w32(p, s.pan | 0); return 0; }],
     ['GetFrequency', 1, (s, [p]) => { m.w32(p, s.freq); return 0; }],
-    ['GetStatus', 1, (s, [p]) => { const t = be.now(); m.w32(p, !s.primary && isPlaying(s, t) ? (1 | (segAt(s, t).loop ? 4 : 0)) : 0); return 0; }],
+    ['GetStatus', 1, (s, [p]) => {
+      // State changes take effect `lead` seconds ahead, but on real DirectSound Play/Stop are immediate: report the
+      // state of the last command while it is still pending. (Before: a buffer polled in the frame after its Play read
+      // "stopped", and the game stopped + released it after one frame = 30 ms blips.)
+      const now = be.now(), last = s.segs[s.segs.length - 1], t = Math.max(now, last.t0);
+      const r = !s.primary && isPlaying(s, t) ? (1 | (segAt(s, t).loop ? 4 : 0)) : 0;
+      m.w32(p, r); return 0;
+    }],
     ['Initialize', 2, () => 0],
     ['Lock', 7, (s, [off, n, pp1, pn1, pp2, pn2, fl]) => {
       if (!s.size) { m.w32(pp1, 0); m.w32(pn1, 0); return 0x88780032 | 0; }      // DSERR_INVALIDCALL (primary buffer)
@@ -241,7 +286,7 @@ export function installDirectSound(m, W, S, out) {
       if (was && segAt(s, t).loop === loop) return 0;
       const c = pos(s, t);
       pushSeg(s, { t0: t, c0: c, rate: s.freq * s.align, loop });
-      post({ op: 'set', id: s.id, at: t, pos: c, freq: s.freq, loop, playing: true });
+      post({ op: 'set', id: s.id, at: t, pos: c, freq: s.freq, loop, playing: true }); dlog(s, 'play', c); s.playAt = t;
       if (!was) { DS.plays++; if (DS.onPlay) DS.onPlay(s); }
       return 0;
     }],
@@ -249,7 +294,7 @@ export function installDirectSound(m, W, S, out) {
       if (!s.size) return 0;
       c = Math.min(c >>> 0, s.size - 1); c -= c % s.align;
       const t = T(), g = segAt(s, t);
-      pushSeg(s, { t0: t, c0: c, rate: g.rate, loop: g.loop }); post({ op: 'set', id: s.id, at: t, pos: c }); return 0;
+      pushSeg(s, { t0: t, c0: c, rate: g.rate, loop: g.loop }); post({ op: 'set', id: s.id, at: t, pos: c }); dlog(s, 'setpos', c); return 0;
     }],
     ['SetFormat', 1, (s, [p]) => { s.wfx = m.u8.slice(p, p + 18); return 0; }],
     ['SetVolume', 1, (s, [v]) => {
@@ -270,7 +315,7 @@ export function installDirectSound(m, W, S, out) {
       if (s.primary) return 0;
       const t = T(); if (!segAt(s, t).rate) return 0;
       const c = pos(s, t);
-      pushSeg(s, { t0: t, c0: c, rate: 0, loop: false }); post({ op: 'set', id: s.id, at: t, pos: c, playing: false }); return 0;
+      pushSeg(s, { t0: t, c0: c, rate: 0, loop: false }); post({ op: 'set', id: s.id, at: t, pos: c, playing: false }); dlog(s, 'stop', c); ended(s); return 0;
     }],
     ['Unlock', 4, (s, [p1, n1, p2, n2]) => {
       if (!s.size) return 0;
@@ -278,6 +323,7 @@ export function installDirectSound(m, W, S, out) {
         if (!p || !n) continue;
         const off = p - s.data.mem; if (off < 0 || off >= s.size) continue;
         const bytes = m.u8.slice(p, p + Math.min(n, s.size - off));
+        noteWrite(s, off, bytes.length); dlog(s, 'write', off);
         post({ op: 'write', id: s.data.id, off, bytes }, [bytes.buffer]);
       }
       return 0;

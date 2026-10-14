@@ -410,6 +410,9 @@ def serve(game, port, open_browser, mp=False, lan=False, single=False, legacy_po
     sys.path.insert(0, os.path.join(HERE, "recomp"))
     import serve_game, mp_relay
     serve_game.Handler.root = os.path.normpath(os.path.abspath(game))
+    if os.environ.get("HOBBIT_THROTTLE"):
+        serve_game.Handler.throttle = serve_game.Throttle(os.environ["HOBBIT_THROTTLE"])
+        say(f"game data throttled (dev): {serve_game.Handler.throttle}")
     host = "0.0.0.0" if lan else "127.0.0.1"
     ensure_wasm_gz()
     relay = None
@@ -481,7 +484,11 @@ def main():
     ap.add_argument("--multi-port", dest="single", action="store_false", help="the 3-port layout: page, data port+1, relay port+2")
     ap.add_argument("--legacy-ports", action="store_true", default=None, help="with --single: also serve the data on port+1 "
                     "and the relay on port+2 (default in Docker, for the Tailscale serve ports 8443 / 10000)")
+    ap.add_argument("--throttle", metavar="MS:MBIT", help="dev: emulate a slow remote server for the game data, e.g. 80:20 = "
+                    "80 ms per request and 20 Mbit/s shared (also env HOBBIT_THROTTLE)")
     a = ap.parse_args()
+    if a.throttle:
+        os.environ["HOBBIT_THROTTLE"] = a.throttle
     docker = bool(os.environ.get("HOBBIT_IN_DOCKER"))
     single = docker if a.single is None else a.single
     legacy = single and (docker if a.legacy_ports is None else a.legacy_ports)

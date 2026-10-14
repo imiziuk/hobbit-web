@@ -24,7 +24,7 @@ class DsProcessor extends AudioWorkletProcessor {
     if (currentFrame - this.lastStats >= sampleRate / 4) {
       const st = this.mx.stats; let voices = 0;
       for (const v of this.mx.voices.values()) if (v.playing) voices++;
-      this.port.postMessage({ op: 'stats', rms: Math.sqrt(st.sumsq / Math.max(1, st.n)), peak: st.peak, voices, frame: currentFrame });
+      this.port.postMessage({ op: 'stats', rms: Math.sqrt(st.sumsq / Math.max(1, st.n)), peak: st.peak, voices, frame: currentFrame, late: this.mx.late, lateMs: this.mx.lateMax * 1000 / sampleRate });
       st.sumsq = 0; st.n = 0; st.peak = 0; this.lastStats = currentFrame;
     }
     return true;

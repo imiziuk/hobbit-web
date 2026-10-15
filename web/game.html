@@ -25,6 +25,22 @@
   #dlBar { width: 220px; }
   #dlText { color: var(--muted); font-family: ui-monospace, monospace; }
   #mpPlayers { margin: 0; padding-left: 18px; font-size: 12px; }
+  .devbadge { display: inline-block; background: #b8860b; color: #000; font-weight: 700; font-size: 10px; padding: 0 4px; border-radius: 3px; margin-left: 4px; }
+  #mpEvents { margin: 0; padding: 4px 6px 4px 22px; max-height: 140px; overflow: auto; font: 11px/1.35 ui-monospace, monospace; background: #151515; }
+  #mpEvents li.sus { color: #f88; }
+  #mpEvents:empty::before { content: "no developer-mode events in this room"; color: var(--muted); margin-left: -16px; }
+  #dev { background: var(--panel); padding: 8px 10px; margin: 8px 0; max-width: 620px; display: grid; gap: 6px; font-size: 12px; }
+  #dev .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  #dev button, #dev select { background: #2a2a2a; color: var(--fg); border: 1px solid #444; padding: 3px 8px; font: inherit; cursor: pointer; }
+  #dev button:disabled, #dev select:disabled { opacity: .45; cursor: default; }
+  #devStatus, #devKeys { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }
+  #dev.on { outline: 1px solid #b8860b; }
+  #devOverlay { position: absolute; right: 6px; top: 6px; z-index: 5; pointer-events: none; white-space: pre; background: rgba(0,0,0,.6);
+    color: #ffd25e; font: 11px/1.3 ui-monospace, monospace; padding: 4px 6px; border-radius: 4px; max-width: calc(100% - 20px); overflow: hidden; }
+  #devOverlay[hidden] { display: none; }
+  #toasts { position: absolute; left: 50%; bottom: 52px; transform: translateX(-50%); z-index: 7; display: grid; gap: 4px; pointer-events: none; width: max-content; max-width: 90%; }
+  #toasts div { background: rgba(20,20,20,.88); color: #fff; border-left: 3px solid #b8860b; padding: 4px 10px; font-size: 12px; border-radius: 3px; }
+  #toasts div.sus { border-left-color: #e44; }
   #stage { position: relative; max-width: 640px; }
   #opts { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 6px 0; font-size: 12px; }
   #opts button, #panelsClose { background: #2a2a2a; color: var(--fg); border: 1px solid #444; padding: 3px 10px; font: inherit; cursor: pointer; }
@@ -67,6 +83,8 @@
   <div id="nojspi" hidden></div>
   <div id="stage">
     <canvas id="screen" width="640" height="480" tabindex="0"></canvas>
+    <div id="devOverlay" hidden></div>
+    <div id="toasts" aria-live="polite"></div>
     <div id="rotate">Turn the phone sideways (landscape)</div>
     <div id="opts">
       <label><input type="checkbox" id="touchOn"> Phone controls</label>
@@ -88,6 +106,28 @@
       <button id="mpConnect">Connect</button><button id="mpDisconnect">Disconnect</button></div>
     <div id="mpStatus">offline</div>
     <ul id="mpPlayers"></ul>
+    <div class="row"><label title="The room creator decides whether players may use developer mode in this room (sent when the room is created; the owner can change it later). Every change is logged by the relay."><input type="checkbox" id="mpAllowDev" checked> Allow developer mode in this room</label> <span id="mpOwner" style="color:var(--muted)"></span></div>
+    <div><strong style="font-size:12px">Developer-mode log</strong> <span style="color:var(--muted);font-size:11px">(from the relay: who switched it on/off and every dev action)</span></div>
+    <ol id="mpEvents"></ol>
+  </section>
+  <section id="dev" aria-label="Developer">
+    <div class="row"><strong>Developer</strong>
+      <label><input type="checkbox" id="devOn"> Developer mode (F10)</label>
+      <label><input type="checkbox" id="devOverlayOn" checked> Overlay (F2)</label>
+      <span id="devStatus">off</span></div>
+    <div class="row">
+      <button id="devFly" type="button" title="The game's own developer flight (Ctrl+F); A = up, D = down">Fly (Ctrl+F)</button>
+      <label><input type="checkbox" id="devGod"> God mode (F6)</label>
+      <button id="devHeal" type="button">Refill health (F7)</button>
+      <label><input type="checkbox" id="devWire"> Wireframe (F5)</label>
+      <label>Speed <select id="devSpeed"></select></label></div>
+    <div class="row">
+      <label>Slot <select id="devSlot"><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+      <button id="devSave" type="button">Save position (F8)</button><button id="devLoad" type="button">Teleport to slot (F9)</button>
+      <select id="devPlayer"><option value="">(player)</option></select><button id="devToPlayer" type="button">Teleport to player</button></div>
+    <div class="row"><label>Level <select id="devLevel"></select></label><button id="devWarp" type="button">Warp</button></div>
+    <div id="devKeys">Keys (only while on): Ctrl+F fly (A up, D down) · F4 game fast-forward · F5 wireframe · F6 god · F7 health ·
+      F8/F9 save/teleport slot · [ ] speed · F2 overlay · F10 on/off. In multiplayer everyone in the room sees that you use it.</div>
   </section>
   <section id="dl" aria-label="Game data">
     <div class="row"><strong>Game data</strong>

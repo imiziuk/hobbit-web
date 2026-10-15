@@ -33,6 +33,9 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
     ws: null, status: 'offline', id: null, slot: null, name: 'Hobbit', room: 'main', url: '',
     players: new Map(),     // id -> {id, slot, name, level, have, prev, target, cur, t0, anim, weapon}
     npc: new Map(),         // slot -> {obj, spawn:[x,y,z], parked}
+    events: [],             // developer-mode events of this room (relay "dev" messages, newest last; docs/DEVMODE.md)
+    owner: null, allowDev: true, allowDevWanted: true, devSelf: false,
+    onDev: null, onWelcome: null,   // hooks for web/devmode.mjs
     local: null, lastSend: 0, lastKeep: 0, lastScan: -1e9, levelKey: 0, stats: { sent: 0, recv: 0, applied: 0, animCalls: 0, errors: 0 },
   };
 
@@ -147,10 +150,13 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
     if (msg.t === 'welcome') {
       mp.id = msg.id; mp.slot = msg.slot; mp.status = 'online'; mp.players.clear();
       for (const p of msg.players) mp.players.set(p.id, { ...p, have: false });
+      mp.owner = msg.owner ?? null; mp.allowDev = msg.allowDev !== false; mp.devSelf = false;
+      mp.events = (msg.events || []).slice(-50);
+      if (mp.onWelcome) try { mp.onWelcome(msg); } catch (e) { log('[mp] dev hook: ' + e.message); }
       log(`[mp] connected as #${msg.id}, slot ${msg.slot} (${msg.guid}), room ${msg.room}, ${msg.players.length} other player(s)`);
     } else if (msg.t === 'join') {
       const P = mp.players.get(msg.id);
-      if (P) Object.assign(P, { name: msg.name, slot: msg.slot }); else { mp.players.set(msg.id, { ...msg, have: false }); log(`[mp] ${msg.name} joined (slot ${msg.slot})`); }
+      if (P) Object.assign(P, { name: msg.name, slot: msg.slot, dev: !!msg.dev }); else { mp.players.set(msg.id, { ...msg, have: false }); log(`[mp] ${msg.name} joined (slot ${msg.slot})`); }
     } else if (msg.t === 'leave') {
       const P = mp.players.get(msg.id); mp.players.delete(msg.id); if (P) log(`[mp] ${P.name} left`);
     } else if (msg.t === 's') {
@@ -163,6 +169,15 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
       P.prev = P.have && P.cur && !far ? { ...snap, p: P.cur.p, r: P.cur.r } : snap;   // Player::updateExistingPlayer
       P.target = snap; P.t0 = t; P.have = true; P.last = t;
       if (!P.cur || far) P.cur = { p: snap.p, r: snap.r };
+    } else if (msg.t === 'dev') {        // developer-mode event, from the relay (its state is the source of the badge)
+      if (msg.id === mp.id) mp.devSelf = !!msg.dev;
+      else { const P = mp.players.get(msg.id); if (P) P.dev = !!msg.dev; }
+      mp.events.push(msg); if (mp.events.length > 200) mp.events.shift();
+      if (mp.onDev) try { mp.onDev(msg); } catch (e) { log('[mp] dev hook: ' + e.message); }
+    } else if (msg.t === 'room') {
+      mp.owner = msg.owner; mp.allowDev = msg.allowDev !== false;
+      mp.events.push({ t: 'room', ts: new Date().toISOString(), allowDev: mp.allowDev, by: msg.by, owner: msg.owner });
+      if (mp.onDev) try { mp.onDev(mp.events[mp.events.length - 1]); } catch (e) { log('[mp] dev hook: ' + e.message); }
     } else if (msg.t === 'full') {
       log('[mp] room is full (8 players)');
     }
@@ -183,7 +198,7 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
     let ws;
     try { ws = new WebSocket(url); } catch (e) { mp.status = 'error: ' + e.message; onChange(mp); scheduleRetry(); return; }
     mp.ws = ws;
-    ws.onopen = () => { retries = 0; ws.send(JSON.stringify({ t: 'hello', name: mp.name, room })); };
+    ws.onopen = () => { retries = 0; ws.send(JSON.stringify({ t: 'hello', name: mp.name, room, allowDev: mp.allowDevWanted })); };
     ws.onmessage = e => { try { onMessage(JSON.parse(e.data)); } catch (err) { log('[mp] bad message: ' + err.message); } };
     ws.onclose = () => { if (mp.ws === ws) { mp.ws = null; mp.id = 0; mp.status = 'offline'; mp.players.clear(); onChange(mp); log('[mp] disconnected'); scheduleRetry(); } };
     ws.onerror = () => { if (mp.ws === ws) { mp.status = 'error (is the relay running?)'; onChange(mp); } };
@@ -197,6 +212,9 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
     mp.want = null; if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     if (mp.ws) { const ws = mp.ws; mp.ws = null; ws.close(); } mp.id = 0; mp.status = 'offline'; mp.players.clear(); onChange(mp);
   };
+  mp.sendDev = (a, detail = {}) => send(Object.assign({}, detail, { t: 'dev', a }));
+  mp.setAllowDev = on => send({ t: 'room', allowDev: !!on });
+  mp.online = () => mp.status === 'online';
   mp.tick = () => { try { tick(); } catch (e) { mp.stats.errors++; if (mp.stats.errors < 5) log('[mp] tick error: ' + e.message); } };
   mp.findObjects = findObjects; mp.readLocal = () => inLevel() ? readLocal() : null; mp.scan = scan;
 

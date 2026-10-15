@@ -136,6 +136,18 @@ other. Remote players are the fake-Bilbo NPCs of **The Hobbit Synchrony v3**
 into `cache/` and served as virtual archives; nothing is written to the game folder. Details and what is not synced
 yet: `docs/MULTIPLAYER.md`.
 
+## Developer mode
+
+**F10** (or the **Developer** panel under the game) turns on the game's own developer features plus a few extras:
+Ctrl+F flight (A up, D down), F4 fast-forward, F5 wireframe, F6 god mode, F7 refill health, F8/F9 save/teleport to a
+position slot, `[` `]` game speed, teleport to another player, level warp, F2 on-screen overlay (FPS, position, state,
+level). Dev keys do nothing while it is off.
+
+In multiplayer it is **public**: the relay keeps who has it on (a DEV badge next to the name, also for late joiners),
+every switch and action shows up as a toast and in the room's "Developer-mode log", and the server log (`docker logs`)
+gets one line per event with time, room, player and IP. The room creator can forbid it ("Allow developer mode in this
+room"); the relay also flags big position jumps of players without dev mode. Details: `docs/DEVMODE.md`.
+
 ## Run it in Docker (with its own Tailscale node)
 
 ```

@@ -9,6 +9,7 @@ import { installMultiplayer } from '../recomp/host/mp.mjs';
 import { installTouch, mergePads } from './touch.mjs';
 import { createAudio } from './audio.mjs';
 import { createPrefetch } from './prefetch.mjs';
+import { installDevMode, describe as describeDev, LEVELS as DEV_LEVELS } from './devmode.mjs';
 
 const q = new URLSearchParams(location.search);
 // Where the game data and the relay are. ?data= / ?mp= always win. Otherwise:
@@ -212,7 +213,8 @@ async function main() {
     }
   };
 
-  setupMultiplayer(m, W);
+  const mpObj = setupMultiplayer(m, W);
+  setupDevMode(m, W, mpObj);
 
   // input -> DirectInput state
   const keys = W.input.keys;
@@ -379,15 +381,36 @@ function setupMultiplayer(m, W) {
     const me = mp.local ? levelName(mp.local.l) : 'menu';
     statusEl.textContent = `${mp.status}` + (mp.room ? ` | room "${mp.room}"` : '') + (mp.id ? ` | you: #${mp.id} slot ${mp.slot} (${me})` : '') +
       ` | fake Bilbos found ${mp.npc.size}/8 | sent ${mp.stats.sent} recv ${mp.stats.recv}`;
-    listEl.replaceChildren(...[...mp.players.values()].map(p => {
+    // the DEV badge comes from the relay's state (welcome/join/dev messages), not from what a client claims locally
+    const badge = () => { const b = document.createElement('span'); b.className = 'devbadge'; b.textContent = 'DEV'; b.title = 'developer mode on (reported by the relay)'; return b; };
+    const items = [...mp.players.values()].map(p => {
       const li = document.createElement('li');
       const same = mp.local && p.level === mp.local.l;
-      li.textContent = `${p.name} (slot ${p.slot}) - ${levelName(p.level)}` + (same && p.have ? ' - here' : '');
+      li.textContent = `${p.name} (slot ${p.slot}) - ${levelName(p.level)}` + (same && p.have ? ' - here' : '') + (p.id === mp.owner ? ' - room owner' : '');
+      if (p.dev) li.append(badge());
       return li;
-    }));
+    });
+    if (mp.id) {
+      const li = document.createElement('li');
+      li.textContent = `${mp.name} (you, slot ${mp.slot})` + (mp.owner === mp.id ? ' - room owner' : '');
+      if (mp.devSelf) li.append(badge());
+      items.unshift(li);
+    }
+    listEl.replaceChildren(...items);
+    allowEl.disabled = !!mp.id && mp.owner !== mp.id;
+    allowEl.checked = mp.id ? mp.allowDev : mp.allowDevWanted;
+    const P = mp.players.get(mp.owner);
+    ownerEl.textContent = !mp.id ? '(applies when you create a room)' : mp.owner === mp.id ? '(you own this room)'
+      : `(set by the room owner ${P ? P.name : '#' + mp.owner})`;
   };
+  const allowEl = $('mpAllowDev'), ownerEl = $('mpOwner');
   const mp = installMultiplayer({ m, W, log, onChange: render });
   window.hobbit.mp = mp;
+  mp.allowDevWanted = store('allowDev') !== '0';
+  allowEl.addEventListener('change', () => {
+    if (mp.id) { if (mp.owner === mp.id) mp.setAllowDev(allowEl.checked); }
+    else { mp.allowDevWanted = allowEl.checked; store('allowDev', allowEl.checked ? '1' : '0'); }
+  });
   setInterval(() => render(mp), 1000);
   const wsUrl = v => /^wss?:\/\//.test(v) ? v : (location.protocol === 'https:' ? 'wss://' : 'ws://') + v;
   const go = () => { store('name', nameEl.value); store('url', urlEl.value); store('room', roomEl.value); mp.connect(wsUrl(urlEl.value.trim()), nameEl.value.trim(), roomEl.value.trim() || 'main'); };
@@ -398,6 +421,69 @@ function setupMultiplayer(m, W) {
     if (e.key === 'Enter') { e.preventDefault(); go(); }            // Enter in Name/Server/Room = (re)connect
   });
   if (q.get('mp') || q.get('name') || q.get('room')) go();   // a link with mp=, name= or room= joins automatically
+  return mp;
+}
+
+// Developer panel + overlay + toasts + the room's developer-mode log (web/devmode.mjs, docs/DEVMODE.md)
+function setupDevMode(m, W, mp) {
+  const evEl = $('mpEvents'), toastsEl = $('toasts'), ovEl = $('devOverlay');
+  const toast = (s, sus) => {
+    const d = document.createElement('div'); d.textContent = s; if (sus) d.className = 'sus';
+    toastsEl.append(d); while (toastsEl.children.length > 4) toastsEl.firstChild.remove();
+    setTimeout(() => d.remove(), 6000);
+  };
+  const who = id => id === mp.id ? 'you' : (mp.players.get(id) || {}).name || '#' + id;
+  const line = ev => ev.t === 'room'
+    ? `room setting: developer mode ${ev.allowDev ? 'allowed' : 'NOT allowed'}` + (ev.by ? ` (by ${who(ev.by)})` : ' (new room owner)')
+    : describeDev(ev);
+  const addEvent = (ev, quiet) => {
+    const li = document.createElement('li');
+    li.textContent = `${(ev.ts ? new Date(ev.ts) : new Date()).toLocaleTimeString()} ${line(ev)}`;
+    if (ev.suspicious) li.className = 'sus';
+    evEl.append(li); while (evEl.children.length > 200) evEl.firstChild.remove();
+    evEl.scrollTop = 1e9;
+    if (!quiet) toast(line(ev), ev.suspicious);
+  };
+  const dev = installDevMode({ m, W, mp, log, ui: {
+    toast,
+    overlay: txt => { if (txt === null) { ovEl.hidden = true; return; } ovEl.hidden = false; ovEl.textContent = txt; },
+    onEvent: ev => addEvent(ev),
+    onWelcome: msg => { evEl.replaceChildren(); for (const ev of msg.events || []) addEvent(ev, true); },
+  } });
+  window.hobbit.dev = dev;
+  const box = $('devOn'), panel = $('dev'), st = $('devStatus');
+  const speed = $('devSpeed'), level = $('devLevel'), player = $('devPlayer'), god = $('devGod'), wire = $('devWire'), ov = $('devOverlayOn');
+  speed.replaceChildren(...dev.SPEEDS.map(s => new Option('x' + s, s)));
+  level.replaceChildren(...DEV_LEVELS.map((n, i) => new Option(`${i} ${n}`, i)));
+  const ctl = ['devFly', 'devGod', 'devHeal', 'devWire', 'devSpeed', 'devSlot', 'devSave', 'devLoad', 'devPlayer', 'devToPlayer', 'devLevel', 'devWarp'].map($);
+  const sync = () => {
+    box.checked = dev.on || dev.pending; panel.classList.toggle('on', dev.on);
+    for (const el of ctl) el.disabled = !dev.on;
+    god.checked = dev.god; wire.checked = !!m.r32(0x00777ADC); ov.checked = dev.overlay;
+    if (document.activeElement !== speed) speed.value = String(dev.SPEEDS.includes(dev.speed) ? dev.speed : 1);
+    const s = dev.state();
+    st.textContent = dev.pending ? 'waiting for the relay...' : !dev.on ? 'off'
+      : 'ON' + (mp.online() ? ' (announced to the room)' : ' (offline)') + (s ? ` | state ${s.st} | ${s.pos.join(', ')}` : '');
+    if (!dev.on && !dev.pending) ovEl.hidden = true;
+    const want = [...mp.players.values()].filter(p => p.have).map(p => [String(p.id), `${p.name} (${DEV_LEVELS[p.level] || p.level})`]);
+    const have = [...player.options].slice(1).map(o => [o.value, o.textContent]);
+    if (JSON.stringify(want) !== JSON.stringify(have)) { const v = player.value; player.replaceChildren(new Option('(player)', ''), ...want.map(([a, b]) => new Option(b, a))); player.value = v; }
+  };
+  dev.onChange = sync; setInterval(sync, 500);
+  box.addEventListener('change', () => dev.setOn(box.checked, 'panel'));
+  ov.addEventListener('change', () => { dev.overlay = ov.checked; try { localStorage.setItem('hobbit.dev.overlay', ov.checked ? '1' : '0'); } catch { /* private mode */ } if (!ov.checked) ovEl.hidden = true; });
+  $('devFly').onclick = () => dev.toggleFly();
+  god.addEventListener('change', () => dev.setGod(god.checked));
+  $('devHeal').onclick = () => dev.refill();
+  wire.addEventListener('change', () => m.w32(0x00777ADC, wire.checked ? 1 : 0));   // announced by the watcher
+  speed.addEventListener('change', () => dev.setSpeed(+speed.value));
+  $('devSlot').addEventListener('change', e => { dev.slot = +e.target.value; });
+  $('devSave').onclick = () => dev.saveSlot();
+  $('devLoad').onclick = () => dev.loadSlot();
+  $('devToPlayer').onclick = () => player.value && dev.toPlayer(player.value);
+  $('devWarp').onclick = () => dev.warp(+level.value);
+  for (const el of [speed, level, player, $('devSlot')]) el.addEventListener('keydown', e => e.stopPropagation());
+  sync();
 }
 
 main().catch(e => { log('fatal: ' + e.message + '\n' + e.stack); });

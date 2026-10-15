@@ -78,6 +78,7 @@ Messages are JSON text frames:
 | S→C | `{"t":"join",id,slot,guid,name,level}` / `{"t":"leave","id":3}` / `{"t":"full"}` |
 | C→S→others | state, 20 Hz while in a level: `{"t":"s","l":0,"p":[x,y,z],"r":yaw,"a":anim,"f":frame,"w":weapon}` (+`"id"` added by the relay); `l` = level id from 0x00762B5C (0 = Dream World), `l:-1` = not in a level (sent once per second as keepalive) |
 | C→S | `{"t":"name","name":"..."}`, `{"t":"ping","ts":...}` → `{"t":"pong","ts":...}` |
+| both | developer mode: `{"t":"dev",...}`, `{"t":"room","allowDev":...}`, `hello.allowDev`, `welcome.owner/allowDev/events`, `players[].dev`: see `docs/DEVMODE.md` section 3 |
 
 ~90 bytes per state message, 20 Hz, so about 2 KB/s up per player and 2 KB/s × (players−1) down.
 

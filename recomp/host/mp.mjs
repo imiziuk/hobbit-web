@@ -37,6 +37,11 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
     owner: null, allowDev: true, allowDevWanted: true, devSelf: false,
     onDev: null, onWelcome: null,   // hooks for web/devmode.mjs
     local: null, lastSend: 0, lastKeep: 0, lastScan: -1e9, levelKey: 0, stats: { sent: 0, recv: 0, applied: 0, animCalls: 0, errors: 0 },
+    // extension points (recomp/host/mp_skins.mjs, mp_enemies.mjs, mp_world.mjs; installed by web/game.mjs):
+    listeners: [],   // fn(msg): every relay message, after the built-in handling (unknown types too)
+    frameHooks: [],  // fn(local | null, t): every present, after the remote players were applied (local = null outside a level)
+    levelHooks: [],  // fn(local): when the level / Bilbo pointer changes (object table rescanned)
+    ext: {},         // name -> module state
   };
 
   /* ------------------------------------------------------------------ game memory */
@@ -52,6 +57,12 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
       const lo = m.r32(o + 8);
       if (guids.has(lo)) out.set(lo, o);
     }
+    return out;
+  }
+  function scanObjects(pred) {           // every live object (pointer) for which pred(obj) is true; the table is 0x14-byte entries
+    const base = m.r32(A.objTable), n = m.r32(A.objCount), out = [];
+    if (!base || n > 100000) return out;
+    for (let i = 0; i < n; i++) { const o = m.r32(base + i * 0x14); if (o && pred(o)) out.push(o); }
     return out;
   }
   const animCtrl = o => { const s1 = m.r32(o + 0x304), s2 = s1 && m.r32(s1 + 0x50); return s2 ? m.r32(s2 + 0x10C) : 0; };
@@ -103,11 +114,18 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
 
   /* ------------------------------------------------------------------ per frame */
   function tick() {
-    if (!inLevel()) { mp.npc.clear(); mp.levelKey = 0; keepalive(); return; }
+    if (!inLevel()) {
+      if (mp.levelKey) for (const fn of mp.levelHooks) try { fn(null); } catch (e) { hookErr('level', e); }
+      mp.npc.clear(); mp.levelKey = 0; mp.local = null; keepalive();
+      for (const fn of mp.frameHooks) try { fn(null, now()); } catch (e) { hookErr('frame', e); }
+      return;
+    }
     const t = now();
     const key = m.r32(A.pBilbo) ^ m.r32(A.level) << 24;
-    if (key !== mp.levelKey || t - mp.lastScan > (mp.npc.size ? 5 : 1)) { mp.levelKey = key; scan(); }
+    const newLevel = key !== mp.levelKey;
+    if (newLevel || t - mp.lastScan > (mp.npc.size ? 5 : 1)) { mp.levelKey = key; scan(); }
     const local = mp.local = readLocal();
+    if (newLevel) for (const fn of mp.levelHooks) try { fn(local); } catch (e) { hookErr('level', e); }
     if (mp.status === 'online' && t - mp.lastSend >= 1 / SEND_HZ) {
       mp.lastSend = t; mp.lastKeep = t;
       send(Object.assign({ t: 's' }, local, { p: local.p.map(v => Math.round(v * 100) / 100), r: +local.r.toFixed(4), f: +local.f.toFixed(2) }));
@@ -136,7 +154,9 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
       setPos(N.obj, ...N.spawn);
       N.anim = -1;
     }
+    for (const fn of mp.frameHooks) try { fn(local, t); } catch (e) { hookErr('frame', e); }
   }
+  const hookErr = (what, e) => { mp.stats.errors++; if (mp.stats.errors < 8) log(`[mp] ${what} hook: ${e.message}`); };
   function keepalive() {
     const t = now();
     if (mp.status === 'online' && t - mp.lastKeep > 1) { mp.lastKeep = t; send({ t: 's', l: -1 }); }
@@ -181,6 +201,7 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
     } else if (msg.t === 'full') {
       log('[mp] room is full (8 players)');
     }
+    for (const fn of mp.listeners) try { fn(msg); } catch (e) { hookErr('message', e); }
     onChange(mp);
   }
   // Reconnect automatically when the connection drops (relay restart, Wi-Fi blip, a proxy closing an idle socket);
@@ -217,6 +238,9 @@ export function installMultiplayer({ m, W, log = console.log, onChange = () => {
   mp.online = () => mp.status === 'online';
   mp.tick = () => { try { tick(); } catch (e) { mp.stats.errors++; if (mp.stats.errors < 5) log('[mp] tick error: ' + e.message); } };
   mp.findObjects = findObjects; mp.readLocal = () => inLevel() ? readLocal() : null; mp.scan = scan;
+  // for the extension modules
+  Object.assign(mp, { send, scanObjects, setPos, setAnim, animCtrl, validNpc, inLevel, rf, wf, f32bits, now, A, NPC_TYPE,
+    isHost: () => !!mp.id && mp.owner === mp.id });
 
   const prev = W.onPresent;
   W.onPresent = n => { if (prev) prev(n); mp.tick(); };

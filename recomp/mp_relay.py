@@ -12,6 +12,9 @@ client -> server   {"t":"hello","name":"Ivan","room":"main"}           first mes
                    {"t":"name","name":"..."}
                    {"t":"dev","a":"on"|"off"|<action>, ...detail}       developer mode (docs/DEVMODE.md)
                    {"t":"room","allowDev":true|false}                    room owner only
+                   {"t":"e", ...}  {"t":"w","g":"<GUID>", ...}             game-state extensions (enemies / world objects),
+                                                                          relayed with "id" like "s"; the latest "w" per
+                                                                          (level, g) is kept and sent in welcome.world
 server -> client   {"t":"welcome","id":N,"slot":k,"guid":"0D8AD910_E8851002","room":"main","players":[...]}
                    {"t":"join","id":N,"slot":k,"guid":...,"name":...}  {"t":"leave","id":N}  {"t":"full"}
                    {"t":"dev","id":N,"name":...,"a":...,"dev":bool,"ts":...,...}  to EVERYONE in the room, sender too
@@ -134,12 +137,14 @@ class Relay:
             others = list(members.values())
             members[c.id] = c
             if new_room or room not in self.meta:
-                self.meta[room] = {"owner": c.id, "allowDev": bool(allow_dev), "events": collections.deque(maxlen=EVENTS_KEPT)}
+                self.meta[room] = {"owner": c.id, "allowDev": bool(allow_dev), "events": collections.deque(maxlen=EVENTS_KEPT),
+                                   "world": {}}
             meta = self.meta[room]
             events = list(meta["events"])
+            world = list(meta.setdefault("world", {}).values())
         c.send({"t": "welcome", "id": c.id, "slot": c.slot, "guid": GUIDS[c.slot], "room": room,
                 "players": [self.info(m) for m in others], "owner": meta["owner"], "allowDev": meta["allowDev"],
-                "events": events})
+                "events": events, "world": world})
         for m in others:
             m.send(dict(self.info(c), t="join"))
         self.log(f"[relay] {c.ip} joined room {room!r} as #{c.id} {name!r} slot {c.slot} ({len(others) + 1} in room)")
@@ -256,6 +261,21 @@ class Relay:
             self.event(c, "flag", {"note": why + " without dev mode (respawns/cutscenes can also do this)",
                                    "to": [round(v, 1) for v in p]}, suspicious=True)
 
+    def remember_world(self, c, msg):
+        """Keeps the latest "w" message per (level, GUID) so late joiners get the room's world state in welcome.world
+        (a reset of a level's state: {"t":"w","reset":true,"l":N}, or the whole room with no "l")."""
+        g, l = msg.get("g"), msg.get("l", c.level)
+        with self.lock:
+            meta = self.meta.get(c.room)
+            if not meta:
+                return
+            world = meta.setdefault("world", {})
+            if msg.get("reset"):
+                for k in [k for k in world if "l" not in msg or k[0] == l]:
+                    world.pop(k, None)
+            elif isinstance(g, str) and len(g) <= 32 and len(world) < 4096:
+                world[(l, g)] = msg
+
     def leave(self, c):
         if c.id is None:
             return
@@ -308,6 +328,11 @@ class Relay:
                     if isinstance(msg.get("l"), int):
                         c.level = msg["l"]
                     self.check_motion(c, msg)
+                    self.broadcast(c, msg)
+                elif t in ("e", "w"):                 # game-state extensions: forwarded like "s", world state remembered
+                    msg["id"] = c.id
+                    if t == "w":
+                        self.remember_world(c, msg)
                     self.broadcast(c, msg)
                 elif t == "dev":
                     self.on_dev(c, msg)

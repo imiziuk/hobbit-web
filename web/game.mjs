@@ -6,6 +6,9 @@ import { Win32 } from '../recomp/host/win32.mjs';
 import { installDirectInput, installDirectSound, installD3D8 } from '../recomp/host/dx.mjs';
 import * as com from './d3d8/com.js';
 import { installMultiplayer } from '../recomp/host/mp.mjs';
+import { installSkins } from '../recomp/host/mp_skins.mjs';
+import { installEnemies } from '../recomp/host/mp_enemies.mjs';
+import { installWorld } from '../recomp/host/mp_world.mjs';
 import { installTouch, mergePads } from './touch.mjs';
 import { createAudio } from './audio.mjs';
 import { createPrefetch } from './prefetch.mjs';
@@ -406,6 +409,9 @@ function setupMultiplayer(m, W) {
   const allowEl = $('mpAllowDev'), ownerEl = $('mpOwner');
   const mp = installMultiplayer({ m, W, log, onChange: render });
   window.hobbit.mp = mp;
+  // extension modules: each one registers mp.listeners / frameHooks / levelHooks and may add its own UI under #mpExt
+  for (const [name, install] of [['skins', installSkins], ['enemies', installEnemies], ['world', installWorld]])
+    try { mp.ext[name] = install({ mp, m, W, log, panel: $('mpExt') }); } catch (e) { log(`[mp] ${name} module: ${e.message}`); }
   mp.allowDevWanted = store('allowDev') !== '0';
   allowEl.addEventListener('change', () => {
     if (mp.id) { if (mp.owner === mp.id) mp.setAllowDev(allowEl.checked); }

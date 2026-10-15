@@ -125,3 +125,10 @@ of a frame, never during the game's logic update.
 - No authentication or encryption on the relay (Synchrony uses yojimbo secure connect tokens); use LAN/Tailscale.
 - Old saves made without the layer will not have the fake Bilbos (same as Synchrony).
 - Level id → name table in the panel is a best guess for ids 1-11 (only 0 = Dream World was observed).
+
+## 6. Round 2 (Oct 15): extension modules
+
+`mp.mjs` exposes `mp.listeners` / `mp.frameHooks` / `mp.levelHooks` and helpers; `web/game.mjs` installs three modules with their own UI under `#mpExt`:
+- `recomp/host/mp_skins.mjs`: per-slot tint + HTML name labels (`docs/MP_SKINS.md`).
+- `recomp/host/mp_enemies.mjs`: host-authoritative enemies, per-level host = lowest relay id, `t:"e"` packets (`docs/MP_ENEMIES.md`).
+- `recomp/host/mp_world.mjs`: world objects by GUID (chests, pickups, switches, levers, push blocks): STUB, not written yet; the relay already forwards `t:"w"` and keeps the latest per (level, GUID) in `welcome.world`.

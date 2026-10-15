@@ -11,6 +11,9 @@ const INFINITE = 0xFFFFFFFF, WAIT_TIMEOUT = 0x102, INVALID = 0xFFFFFFFF;
 const ERR = { FILE_NOT_FOUND: 2, PATH_NOT_FOUND: 3, ACCESS_DENIED: 5, INVALID_HANDLE: 6, NO_MORE_FILES: 18, ALREADY_EXISTS: 183,
   INVALID_NAME: 123, INSUFFICIENT_BUFFER: 122, HANDLE_EOF: 38 };
 const isPromise = v => v && typeof v.then === 'function';
+const median = a => { const s = Array.from(a).sort((x, y) => x - y); return s[s.length >> 1]; };
+const LIMITER_RET = 0x004fef38;      // return address of the Game_LevelLoop limiter's Sleep(33 - elapsed) (004fef36)
+const GAME_LAPS = 0x0075fb70 + 0x14; // lap count of g_FrameTimer: Game_LevelLoop laps it once per gameplay frame
 
 export class Win32 {
   constructor(m, vfs, opts = {}) {
@@ -23,6 +26,16 @@ export class Win32 {
     this.debugLog = [];             // OutputDebugString lines
     this.unhandledFilter = 0;
     this.lastFrame = 0; this.frames = 0; this.presentedSincePump = false; this.lastPumpYield = 0;
+    // frame pacing (frameWait / setFps / paceBusy, docs/PACING_2026-10-15.md): rafD = recent refresh intervals (median =
+    // `vsync`), lastRaf = frame time of the latest refresh seen (performance.now() timeline), released = when the last
+    // frame wait ended, gameAt = last Present of a gameplay frame (laps = GAME_LAPS then), win = the fallback's 60-frame window
+    this.pace = { fps: 30, minGap: 11, timerLate: 3, vsync: 1000 / 60, rafD: new Float64Array(15).fill(1000 / 60), rafI: 0, lastRaf: -1e9,
+      released: 0, gameAt: -1e9, laps: 0, skipLimiter: true, autoFallback: true, fellBack: false, win: { n: 0, over: 0, bad: 0 },
+      onFallback: null, stats: { n: 0, timer: 0, limiter: 0 },
+      // one entry per real-time Present (ring of 4000): [t s (performance.now), busy ms (release -> this Present), gap ms,
+      // waited ms, 0 = released by rAF / 1 = by the timer, release - target ms, refresh time - target ms (rAF) or 0,
+      // limiter requested ms, other main-thread Sleep requested ms]
+      trace: [], fLim: 0, fSleep: 0 };
     this.input = { keys: new Uint8Array(256), mouse: { dx: 0, dy: 0, dz: 0, b: [0, 0, 0, 0] },
       cursor: { x: 320, y: 240 },     // main-window client coordinates (GetCursorPos, MSG.pt)
       readPad: null };                // () => {axes:[lx,ly,rx,ry,lt,rt], buttons:[bool]} | null (Gamepad API, set by the page)
@@ -46,22 +59,94 @@ export class Win32 {
     const f = be.open(rel, {}); if (!f) return null;
     const d = f.read(0, f.size()); f.close?.(); return d;
   }
-  /** frame pacing: wait until `gap` ms after the previous frame (virtual: jump; real: next animation frame(s)) */
+  /* ---------------------------------------------------------------- frame pacing (docs/PACING_2026-10-15.md)
+   * In real time IDirect3DDevice8::Present is the only frame pacer (the gameplay limiter's Sleep returns at once, see
+   * Sleep). The cap `pace.fps`: 30 (default), 60, or 0 = every display refresh but never sooner than `minGap` ms
+   * (logic_mgr advances the game by 0 on frames shorter than 10 ms). 60 and 0 apply only in gameplay (Game_LevelLoop
+   * lapped its frame timer in the last 0.5 s): the front end feeds its audio and music a fixed dt of 1/29.97 per frame,
+   * so it stays at 30. Gameplay above 30 falls back to 30 for the session when the frame's work does not fit (paceBusy). */
+  setFps(fps) {
+    const P = this.pace;
+    P.fps = fps === 60 || fps === 0 ? fps : 30;
+    P.fellBack = false; P.win.n = P.win.over = P.win.bad = 0;
+    this.m.log(`[pace] cap ${P.fps === 0 ? 'every display refresh (>= ' + P.minGap + ' ms)' : P.fps + ' fps'} in gameplay, 30 fps elsewhere`);
+  }
+  /** the cap in force now: 30 outside gameplay or after a fallback */
+  activeFps() {
+    const P = this.pace;
+    return P.fellBack || this.m.clock.now() - P.gameAt > 500 ? 30 : P.fps;
+  }
+  /** ms between two Presents now */
+  presentGap() { const f = this.activeFps(); return f === 30 ? 1000 / 30 : f === 60 ? 1000 / 60 : this.pace.minGap; }
+  /** Automatic fallback above 30 fps: windows of 60 frames; a frame is "over" when its work (previous release -> this
+   *  Present) took more than 80% of the frame period. Two windows in a row with more than a quarter over -> 30 fps for the
+   *  session. Frames with more than 100 ms of work (loads, first-use hitches) are not steady cost and are skipped. */
+  paceBusy(ms) {
+    const P = this.pace, fps = this.activeFps();
+    if (fps === 30 || !P.autoFallback) { P.win.n = P.win.over = P.win.bad = 0; return; }
+    if (ms > 100) return;
+    const period = fps === 60 ? 1000 / 60 : Math.max(P.minGap, P.vsync), W = P.win;
+    if (ms > period * 0.8) W.over++;
+    if (++W.n < 60) return;
+    W.bad = W.over > 15 ? W.bad + 1 : 0;
+    if (W.bad >= 2) {
+      P.fellBack = true;
+      this.m.log(`[pace] falling back to 30 fps: ${W.over}/60 frames needed more than ${(period * 0.8).toFixed(1)} ms of work (2 windows in a row)`);
+      if (P.onFallback) P.onFallback(W.over);
+      W.bad = 0;
+    }
+    W.n = W.over = 0;
+  }
+  /** Frame wait: until `gap` ms after the previous frame. Virtual clock: a deadline (jump). Real time: the display refresh
+   *  that reaches the target (requestAnimationFrame), or a timer a few ms after the refresh where that frame is expected,
+   *  whichever comes first. The timer is what keeps the cadence when rAF callbacks come late or not at all (compositor
+   *  back pressure, an occluded or hidden window, a 30 Hz embedded pane): the old fixed `target + 50 ms` fallback made
+   *  the 72-100 ms frames. `lastFrame` is always a refresh time (seen or predicted), so the cadence stays on the vsync grid. */
   frameWait(gap, kind) {
-    const m = this.m, clk = m.clock;
+    const m = this.m, clk = m.clock, P = this.pace;
+    const present = kind === 'Present';
+    if (present) {
+      const laps = m.r32(GAME_LAPS);
+      if (laps !== P.laps) { P.laps = laps; P.gameAt = clk.now(); }
+      if (!clk.virtual) gap = this.presentGap();         // virtual clock: the caller's 33.4 (recomp/boot_node.mjs runs)
+    }
     const target = this.lastFrame + gap;
-    const done = () => { this.lastFrame = Math.max(clk.now(), clk.virtual ? target : 0); };
     if (clk.virtual) {
+      const done = () => { this.lastFrame = Math.max(clk.now(), target); };
       return new Wait({ deadline: target, timeout: 0, what: kind, check: () => (clk.now() >= target ? (done(), 0) : undefined) });
     }
+    const now = clk.now(), off = now - performance.now(), relPrev = P.released;
+    if (present) { this.paceBusy(now - relPrev); P.stats.n++; }
+    // a refresh counts when its frame time is within `slack` of the target: half a refresh, at most a quarter of the gap,
+    // and never closer than 10.5 ms to the previous frame; for "every refresh" (gap = minGap) none at all
+    const vs = P.vsync, slack = gap <= P.minGap ? 0 : Math.max(0, Math.min(vs * 0.5, gap * 0.25, gap - 10.5));
+    // the refresh where the frame is expected, predicted from the last one seen (if recent); the timer fires a bit after it
+    const base = P.lastRaf + off;
+    let expect = target;
+    if (now - base < 500) expect = base + Math.max(0, Math.ceil((target - slack - base) / vs - 1e-6)) * vs;
     let ok = false;
     const p = new Promise(res => {
-      // rAF normally; a timer fallback keeps the game running when rAF is throttled (hidden pane, background tab)
-      let fin = false;
-      const finish = () => { if (fin) return; fin = true; ok = true; done(); res(); };
-      const tick = () => { if (fin) return; if (clk.now() >= target - 2) finish(); else requestAnimationFrame(tick); };
+      let fin = false, tm = 0;
+      const finish = (t, how, frameT) => {
+        if (fin) return; fin = true; ok = true; clearTimeout(tm);
+        // rAF: its refresh time; timer: the expected refresh, unless we are already a whole frame past it
+        this.lastFrame = how === 0 ? frameT : (t - expect < gap ? expect : t);
+        P.released = clk.now(); if (how) P.stats.timer++;
+        if (present) {
+          const tr = P.trace; if (tr.length >= 4000) tr.splice(0, 1000);
+          tr.push([+(performance.now() / 1000).toFixed(4), +(now - relPrev).toFixed(2), +gap.toFixed(1), +(P.released - now).toFixed(2), how,
+            +(P.released - target).toFixed(2), how === 0 ? +(frameT - target).toFixed(2) : 0, P.fLim, P.fSleep]);
+          P.fLim = 0; P.fSleep = 0;
+        }
+        res();
+      };
+      const tick = ts => {
+        if (fin) return;
+        if (ts > P.lastRaf) { const d = ts - P.lastRaf; if (d < 50) { P.rafD[P.rafI++ % P.rafD.length] = d; P.vsync = median(P.rafD); } P.lastRaf = ts; }
+        if (ts + off >= target - slack) finish(clk.now(), 0, ts + off); else requestAnimationFrame(tick);
+      };
       requestAnimationFrame(tick);
-      setTimeout(finish, Math.max(0, target - clk.now()) + 50);
+      tm = setTimeout(() => finish(clk.now(), 1), Math.max(0, expect + P.timerLate - now));
     });
     return new Wait({ promise: p, what: kind, check: () => (ok ? 0 : undefined) });
   }
@@ -177,6 +262,16 @@ export class Win32 {
     def('winmm.dll', 'timeGetTime', 0, () => Math.floor(m.clock.now()) >>> 0);
     def('winmm.dll', 'timeBeginPeriod', 1, zero);
     K('Sleep', 1, ([ms]) => {
+      // The gameplay limiter `Sleep(33 - elapsed)` at 004fef36 (docs/WEB_PORT_LOOPS.md 3) is a second frame pacer on top
+      // of Present. As a timer it woke late and pushed the next Present past its refresh (the 40-55 ms frames), and above
+      // 30 fps it would hold the game at 30. In real time it returns at once (Present paces).
+      if (m.cur === m.mainThread) {
+        const P = this.pace;
+        if (m.callerRet === LIMITER_RET) {
+          P.fLim = ms | 0;
+          if (P.skipLimiter && !m.clock.virtual) { P.stats.limiter++; return 0; }
+        } else P.fSleep += ms;
+      }
       if (ms === 0) return new Yield(0);
       const dl = m.clock.now() + ms;
       return new Wait({ deadline: dl, timeout: 0, what: 'Sleep' });

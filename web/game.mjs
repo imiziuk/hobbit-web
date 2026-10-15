@@ -90,6 +90,22 @@ function setupPhoneUI() {
   if (!document.fullscreenEnabled && !document.webkitFullscreenEnabled) fsBtn.hidden = true;   // e.g. iPhone Safari
 }
 
+// Frame rate cap (docs/PACING_2026-10-15.md): ?fps=30|60|0 (0 = every display refresh, at least 11 ms apart), else the
+// remembered choice (localStorage hobbit.fps), else 30. 60 and 0 apply in gameplay only and fall back to 30 for the
+// session when the frame's work does not fit; the select (#fpsSel in the options row) then says "(fell back)".
+function setupFrameRate(W) {
+  const ls = (k, v) => { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch { /* storage blocked */ } return null; };
+  const parse = v => (v === '60' ? 60 : v === '0' ? 0 : v === '30' ? 30 : null);
+  const sel = $('fpsSel');
+  const label = () => { for (const o of sel.options) o.textContent = o.textContent.replace(/ \(fell back\)$/, ''); if (W.pace.fellBack) sel.selectedOptions[0].textContent += ' (fell back)'; };
+  const apply = (fps, remember) => { sel.value = String(fps); W.setFps(fps); if (remember) ls('hobbit.fps', String(fps)); label(); };
+  W.pace.onFallback = () => { label(); log(`[pace] ${W.pace.fps === 0 ? 'max' : W.pace.fps} fps does not fit on this device here: 30 fps for this session`); };
+  sel.addEventListener('change', () => { apply(parse(sel.value) ?? 30, true); sel.blur(); });
+  sel.addEventListener('keydown', e => e.stopPropagation());       // arrow keys on the select must not move Bilbo
+  apply(parse(q.get('fps')) ?? parse(ls('hobbit.fps')) ?? 30, false);
+  window.hobbit.pace = { set: fps => apply(fps, false), get: () => ({ fps: W.pace.fps, active: W.activeFps(), gap: W.presentGap(), fellBack: W.pace.fellBack, vsync: W.pace.vsync, stats: { ...W.pace.stats } }), trace: () => W.pace.trace };
+}
+
 // Sound: volume slider + mute (remembered); the AudioContext starts on the first click / key / touch (autoplay policy)
 const audio = createAudio({ log: s => log(s) });
 function setupAudioUI() {
@@ -323,6 +339,7 @@ async function main() {
   canvas.addEventListener('contextmenu', e => e.preventDefault());
   window.hobbit.press = (code, ms = 150) => { const k = DIK[code]; keys[k] = 0x80; setTimeout(() => { keys[k] = 0; }, ms); };
   window.hobbit.m = m; window.hobbit.W = W;
+  setupFrameRate(W);
 
   if (q.get('perf')) window.hobbit.perf = installPerf({ m, W, httpBe, gl, log }, { glWrap: q.get('perf') === '2' });
   setupPrefetch(httpBe);

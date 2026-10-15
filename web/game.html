@@ -43,6 +43,7 @@
   #toasts div.sus { border-left-color: #e44; }
   #stage { position: relative; max-width: 640px; }
   #opts { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 6px 0; font-size: 12px; }
+  #opts select { background: #2a2a2a; color: var(--fg); border: 1px solid #444; padding: 2px 4px; font: inherit; }
   #opts button, #panelsClose { background: #2a2a2a; color: var(--fg); border: 1px solid #444; padding: 3px 10px; font: inherit; cursor: pointer; }
   #opts .phone-only { display: none; }
   #opts #vol { width: 90px; vertical-align: middle; }
@@ -90,6 +91,9 @@
       <label><input type="checkbox" id="touchOn"> Phone controls</label>
       <label><input type="checkbox" id="sndOn" checked> Sound</label>
       <input type="range" id="vol" min="0" max="100" value="80" aria-label="Volume" title="Volume">
+      <select id="fpsSel" aria-label="Frame rate" title="Frame rate cap in gameplay (menus and movies stay at 30). Falls back to 30 by itself when this device is too slow.">
+        <option value="30">30 fps</option><option value="60">60 fps</option><option value="0">Max fps</option>
+      </select>
       <button id="fsBtn" type="button">Fullscreen</button>
       <button id="panelsBtn" type="button" class="phone-only">Panels</button>
     </div>

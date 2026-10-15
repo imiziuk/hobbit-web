@@ -46,8 +46,42 @@ void rt_ext(u32 t) { R.last_ip = t; rt_trap(T_EXT, t, 0); }
    reads, Present): then host_wait() is called, which is a JSPI suspending import in the async build. */
 __attribute__((import_module("env"), import_name("host_call"))) u32 host_call(u32 t);
 __attribute__((import_module("env"), import_name("host_wait"))) void host_wait(void);
+/* Guest-side fast path for the three hottest imports (host/machine.mjs FAST_BASE: the host binds them at these
+   thunk addresses). The engine's per-thread scratch allocator calls GetCurrentThreadId + Enter/LeaveCriticalSection
+   around every temporary string (1.75 M host calls in one level-load frame). With cooperative green threads a
+   critical section is only ever contended across a yield, so the uncontended / recursive case is answered here:
+   state in the CRITICAL_SECTION itself (+8 RecursionCount, +12 OwningThread, Win32 layout, zeroed by
+   InitializeCriticalSection), the thread id from the TEB (FS:[0x24]). Anything else goes to the host as before.
+   fast_on = 0 (rt_set_fast) routes everything to the host (tracing). fast_n[] counts the calls answered here. */
+#define FAST_BASE 0x7F00F000u
+static u32 fast_on = 1;
+static u32 fast_n[4];
+__attribute__((export_name("rt_set_fast"))) void rt_set_fast(u32 on) { fast_on = on; }
+__attribute__((export_name("rt_fastcnt"))) u32 rt_fastcnt(void) { return (u32)(uintptr_t)fast_n; }
+static int fast_call(u32 t) {
+    u32 esp = R.esp, ret = rd32(esp), tid = rd32(R.fs_base + 0x24);
+    switch (t - FAST_BASE) {
+    case 0: {                                   /* EnterCriticalSection(p) */
+        u32 p = rd32(esp + 4), owner = rd32(p + 12);
+        if (owner == 0) { wr32(p + 12, tid); wr32(p + 8, 1); }
+        else if (owner == tid) wr32(p + 8, rd32(p + 8) + 1);
+        else return 0;                          /* owned by another thread (or garbage): the host decides */
+        fast_n[0]++; R.esp = esp + 8; R.retaddr = ret; R.eax = 0; return 1; }
+    case 4: {                                   /* LeaveCriticalSection(p) */
+        u32 p = rd32(esp + 4);
+        if (rd32(p + 12) == tid) { u32 rec = rd32(p + 8) - 1; if ((i32)rec <= 0) { wr32(p + 8, 0); wr32(p + 12, 0); } else wr32(p + 8, rec); }
+        fast_n[1]++; R.esp = esp + 8; R.retaddr = ret; R.eax = 0; return 1; }
+    case 8:                                     /* GetCurrentThreadId() */
+        fast_n[2]++; R.esp = esp + 4; R.retaddr = ret; R.eax = tid; return 1;
+    }
+    return 0;
+}
 void rt_ext(u32 t) {
-    if (__builtin_expect(t >= 0x7F000000u && t < 0x80000000u, 1)) { if (host_call(t)) host_wait(); return; }
+    if (__builtin_expect(t >= 0x7F000000u && t < 0x80000000u, 1)) {
+        if ((t & ~0xFu) == FAST_BASE && fast_on && fast_call(t)) return;
+        if (host_call(t)) host_wait();
+        return;
+    }
     R.last_ip = t; rt_trap(T_EXT, t, 0);
 }
 /* HLE of a translated function (flat build only): same protocol as an import */

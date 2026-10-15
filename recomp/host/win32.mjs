@@ -4,7 +4,7 @@
 //
 // Every stub: [nargs, fn(args, m, esp)] (stdcall; 'cdecl' entries pop nothing). fn returns EAX, {eax, edx}, a Wait
 // (blocking) or a Yield. Paths go through vfs.mjs (game folder read-only).
-import { Wait, Yield, GuestExit, ThreadExit, hex, SENTINEL } from './machine.mjs';
+import { Wait, Yield, GuestExit, ThreadExit, hex, SENTINEL, FAST } from './machine.mjs';
 import { GAME_ROOT, APPDATA_ROOT } from './vfs.mjs';
 
 const INFINITE = 0xFFFFFFFF, WAIT_TIMEOUT = 0x102, INVALID = 0xFFFFFFFF;
@@ -15,7 +15,6 @@ const isPromise = v => v && typeof v.then === 'function';
 export class Win32 {
   constructor(m, vfs, opts = {}) {
     this.m = m; this.vfs = vfs; this.opts = opts;
-    this.cs = new Map();            // CRITICAL_SECTION address -> {owner, rec}
     this.tlsNext = 0;
     this.msgq = [];                 // posted messages {hwnd, msg, w, l}
     this.classes = new Map(); this.windows = new Map(); this.nextHwnd = 0x10010;
@@ -122,7 +121,7 @@ export class Win32 {
   table() {
     const m = this.m, vfs = this.vfs, W = this;
     const S = new Map();
-    const def = (dll, name, nargs, fn, conv) => S.set(dll + '!' + name, { nargs, fn, conv });
+    const def = (dll, name, nargs, fn, conv, addr) => S.set(dll + '!' + name, { nargs, fn, conv, addr });
     const K = (n, a, f) => def('kernel32.dll', n, a, f), U = (n, a, f) => def('user32.dll', n, a, f), G = (n, a, f) => def('gdi32.dll', n, a, f);
     const ok = () => 1, zero = () => 0;
 
@@ -186,14 +185,16 @@ export class Win32 {
     // ---- heap / memory
     K('HeapCreate', 3, () => m.newHandle({ type: 'heap' }));
     K('HeapDestroy', 1, ok);
-    K('HeapAlloc', 3, ([h, fl, n]) => m.heap.alloc(n, !!(fl & 8) || true));
-    K('HeapFree', 3, ([h, fl, p]) => (p ? m.heap.release(p) : 1));
-    K('HeapSize', 3, ([h, fl, p]) => m.heap.sizeOf(p) ?? 0xFFFFFFFF);
+    // HeapAlloc zero-fills only with HEAP_ZERO_MEMORY (8), like Windows (a fresh block is zero anyway, see GuestHeap)
+    // (index access, not destructuring: the hot shims run ~300 times per frame and `[h, fl, n] = a` allocated an iterator)
+    K('HeapAlloc', 3, a => m.heap.alloc(a[2], (a[1] & 8) !== 0));
+    K('HeapFree', 3, a => (a[2] ? m.heap.release(a[2]) : 1));
+    K('HeapSize', 3, a => m.heap.sizeOf(a[2]) ?? 0xFFFFFFFF);
     K('HeapReAlloc', 4, ([h, fl, p, n]) => {
       const old = m.heap.sizeOf(p); if (old === undefined) return 0;
       if (n <= old) return p;
       if (fl & 0x10) return 0;                                       // HEAP_REALLOC_IN_PLACE_ONLY
-      const q = m.heap.alloc(n, true); m.u8.copyWithin(q, p, p + old); m.heap.release(p); return q;
+      const q = m.heap.alloc(n, (fl & 8) !== 0); m.u8.copyWithin(q, p, p + old); m.heap.release(p); return q;
     });
     W.vregions = new Map();
     K('VirtualAlloc', 4, ([a, n, type, prot]) => {
@@ -212,7 +213,10 @@ export class Win32 {
 
     // ---- threads and synchronisation (cooperative green threads, machine.mjs)
     K('GetCurrentThread', 0, () => 0xFFFFFFFE);
-    K('GetCurrentThreadId', 0, () => m.cur.tid);
+    // GetCurrentThreadId / Enter- / LeaveCriticalSection sit at the FAST.* thunk addresses: recomp/runtime/rt.c answers
+    // them inside wasm (TEB+0x24 = tid; the CRITICAL_SECTION's +8 RecursionCount / +12 OwningThread fields) and only
+    // calls these JS stubs when it cannot (contended or garbage owner, fast path disabled while tracing).
+    def('kernel32.dll', 'GetCurrentThreadId', 0, () => m.cur.tid, undefined, FAST.GetCurrentThreadId);
     const thr = h => (h === 0xFFFFFFFE ? m.cur : (m.handles.get(h)?.T));
     K('SetThreadPriority', 2, ([h, p]) => { const T = thr(h); if (T) T.prio = p | 0; return 1; });
     K('SetThreadAffinityMask', 2, () => 1);
@@ -248,15 +252,21 @@ export class Win32 {
       if (ms === 0) return WAIT_TIMEOUT;
       return new Wait({ check: () => (trySignal(o) ? 0 : undefined), deadline: ms === INFINITE ? Infinity : m.clock.now() + ms, timeout: WAIT_TIMEOUT, what: 'WaitForSingleObject' });
     });
-    K('InitializeCriticalSection', 1, ([p]) => { W.cs.set(p, { owner: null, rec: 0 }); m.bytes(p, 24).fill(0); });
-    K('DeleteCriticalSection', 1, ([p]) => { W.cs.delete(p); });
-    K('EnterCriticalSection', 1, ([p]) => {
-      let c = W.cs.get(p); if (!c) W.cs.set(p, c = { owner: null, rec: 0 });
-      const T = m.cur;
-      if (!c.owner || c.owner === T) { c.owner = T; c.rec++; return 0; }
-      return new Wait({ check: () => (!c.owner ? (c.owner = T, c.rec = 1, 0) : undefined), what: 'EnterCriticalSection' });
-    });
-    K('LeaveCriticalSection', 1, ([p]) => { const c = W.cs.get(p); if (c && c.owner === m.cur && --c.rec === 0) c.owner = null; });
+    K('InitializeCriticalSection', 1, ([p]) => { m.bytes(p, 24).fill(0); });
+    K('DeleteCriticalSection', 1, ([p]) => { m.bytes(p, 24).fill(0); });
+    const liveTid = tid => m.threads.some(T => T.tid === tid && !T.done);
+    def('kernel32.dll', 'EnterCriticalSection', 1, ([p]) => {
+      const tid = m.cur.tid, owner = m.r32(p + 12);
+      if (owner === tid) { m.w32(p + 8, m.r32(p + 8) + 1); return 0; }
+      // free, or owned by a thread that no longer exists / never existed (an uninitialised section in reused memory)
+      if (owner === 0 || !liveTid(owner)) { m.w32(p + 12, tid); m.w32(p + 8, 1); return 0; }
+      return new Wait({ check: () => (m.r32(p + 12) === 0 ? (m.w32(p + 12, tid), m.w32(p + 8, 1), 0) : undefined), what: 'EnterCriticalSection' });
+    }, undefined, FAST.EnterCriticalSection);
+    def('kernel32.dll', 'LeaveCriticalSection', 1, ([p]) => {
+      if (m.r32(p + 12) !== m.cur.tid) return;
+      const rec = (m.r32(p + 8) - 1) | 0;
+      if (rec <= 0) { m.w32(p + 8, 0); m.w32(p + 12, 0); } else m.w32(p + 8, rec);
+    }, undefined, FAST.LeaveCriticalSection);
 
     // ---- files
     const fileErr = path => { const { be, rel } = vfs.split(path); return be && rel !== null ? ERR.FILE_NOT_FOUND : ERR.PATH_NOT_FOUND; };

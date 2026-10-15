@@ -13,6 +13,7 @@ import { installTouch, mergePads } from './touch.mjs';
 import { createAudio } from './audio.mjs';
 import { createPrefetch } from './prefetch.mjs';
 import { installDevMode, describe as describeDev, LEVELS as DEV_LEVELS } from './devmode.mjs';
+import { installPerf } from './perf.mjs';   // ?perf=1|2: run-time profiler (docs/PERF_2026-10-15.md), off by default
 
 const q = new URLSearchParams(location.search);
 // Where the game data and the relay are. ?data= / ?mp= always win. Otherwise:
@@ -37,8 +38,12 @@ const snaps = (q.get('snap') || '').split(',').filter(Boolean).map(Number);
 const $ = id => document.getElementById(id);
 const logEl = $('log'), statEl = $('stat');
 const lines = [];
-const log = s => { lines.push(s); if (lines.length > 400) lines.shift(); logEl.textContent = lines.slice(-60).join('\n'); logEl.scrollTop = 1e9; };
-window.hobbit = { lines };
+// The log DOM is rebuilt at most once per 50 ms, not per line: OutputDebugStringA cost 0.5 ms per call through here
+// (a level load prints 50+ lines inside one frame = 25 ms). A timer, not rAF, so it also flushes in a hidden tab.
+let logTimer = 0;
+const flushLog = () => { logTimer = 0; logEl.textContent = lines.slice(-60).join('\n'); logEl.scrollTop = 1e9; };
+const log = s => { lines.push(s); if (lines.length > 400) lines.shift(); if (!logTimer) logTimer = setTimeout(flushLog, 50); };
+window.hobbit = { lines, flushLog };
 
 // KeyboardEvent.code -> DirectInput scan code (DIK_*)
 const DIK = { Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8, Digit8: 9, Digit9: 10, Digit0: 11,
@@ -319,6 +324,7 @@ async function main() {
   window.hobbit.press = (code, ms = 150) => { const k = DIK[code]; keys[k] = 0x80; setTimeout(() => { keys[k] = 0; }, ms); };
   window.hobbit.m = m; window.hobbit.W = W;
 
+  if (q.get('perf')) window.hobbit.perf = installPerf({ m, W, httpBe, gl, log }, { glWrap: q.get('perf') === '2' });
   setupPrefetch(httpBe);
   log(`starting at entry ${hex(m.pe.entry)}`);
   try {

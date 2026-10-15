@@ -126,11 +126,11 @@ export class Font {
       this.canvas.width = w; this.canvas.height = h;
       ctx.font = this.css; ctx.textBaseline = "top"; ctx.fillStyle = "#fff"; ctx.clearRect(0, 0, w, h);
       lines.forEach((l, i) => { const lw = ctx.measureText(l).width; ctx.fillText(l, (fmt & DT.CENTER) ? (w - lw) / 2 : (fmt & DT.RIGHT) ? w - lw : 0, i * this.lineH + Math.round(this.lineH * 0.1)); });
-      const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+      const tex = gl.createTexture(); this.dev.bindForUpload(tex);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, this.canvas);
       ent = {tex: new GLTex(tex), w, h}; this.cache.set(key, ent);
-      if (this.cache.size > 256){ const [k, v] = this.cache.entries().next().value; gl.deleteTexture(v.tex.tex); this.cache.delete(k); }
+      if (this.cache.size > 256){ const [k, v] = this.cache.entries().next().value; gl.deleteTexture(v.tex.tex); this.dev.texDeleted(v.tex.tex); this.cache.delete(k); }
     }
     // clip (no DT_NOCLIP): shrink the quad to the rect
     let x0 = x, y0 = y, x1 = x + ent.w, y1 = y + ent.h, u0 = 0, v0 = 0, u1 = 1, v1 = 1;

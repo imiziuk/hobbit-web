@@ -883,7 +883,9 @@ def main():
     d += ["0x%Xu,%s" % (e, "\n" if k % 8 == 7 else " ") for k, e in enumerate(order)]
     d.append("};\nstatic void (*const FN[%d])(void) = {\n" % len(order))
     d += ["F_%08x,%s" % (e, "\n" if k % 8 == 7 else " ") for k, e in enumerate(order)]
-    d.append("};\nvoid disp(u32 t) {\n  u32 lo = 0, hi = %d;\n  while (lo < hi) { u32 m = (lo + hi) >> 1; if (ADDR[m] < t) lo = m + 1; else hi = m; }\n"
+    # host thunks (>= 0x7F000000: imports, HLE, COM vtables) skip the search: 9k such calls per frame, 1.75 M per level load
+    d.append("};\nvoid disp(u32 t) {\n  if (__builtin_expect(t >= 0x7F000000u, 0)) { rt_ext(t); return; }\n  u32 lo = 0, hi = %d;\n"
+             "  while (lo < hi) { u32 m = (lo + hi) >> 1; if (ADDR[m] < t) lo = m + 1; else hi = m; }\n"
              "  if (lo < %d && ADDR[lo] == t) { FN[lo](); return; }\n  rt_ext(t);\n}\n" % (len(order), len(order)))
     put(os.path.join(cdir, "dispatch.c"), "".join(d))
     with open(os.path.join(opt.out, "funcs.txt"), "w") as f:

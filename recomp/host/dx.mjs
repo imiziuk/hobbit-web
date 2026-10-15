@@ -388,18 +388,24 @@ export async function installD3D8(m, W, S, gl, comModule) {
   m.com = bridge;
   S.set('d3d8.dll!Direct3DCreate8', { nargs: 1, fn: ([sdk]) => { const p = bridge.Direct3DCreate8(sdk); m.log(`Direct3DCreate8(${sdk}) -> ${hex(p)}`); return p; } });
   W.d3dCalls = new Map();
-  m.onCom = (name, r) => {
-    if (name === 'IDirect3D8::CreateDevice') {
-      m.log(`IDirect3D8::CreateDevice -> ${hex(r)}`);
-      m.fpucw = m.fpucw & ~0x300;                       // D3D without FPU_PRESERVE drops the x87 to 24-bit precision
-    }
-    if (name === 'IDirect3DDevice8::Present') {
-      W.frames++; W.presentedSincePump = true;
-      if (W.onPresent) W.onPresent(W.frames);
-      return W.frameWait(33.4, 'Present');
-    }
-    if (r === undefined) return 0;
+  // per-thunk hooks (machine.mjs runs them after ComBridge.dispatch; a returned value replaces the result)
+  m.comHook[m.comIndex('IDirect3D8', 'CreateDevice')] = r => {
+    m.log(`IDirect3D8::CreateDevice -> ${hex(r)}`);
+    m.fpucw = m.fpucw & ~0x300;                         // D3D without FPU_PRESERVE drops the x87 to 24-bit precision
   };
+  m.comHook[m.comIndex('IDirect3DDevice8', 'Present')] = () => {
+    W.frames++; W.presentedSincePump = true;
+    if (W.onPresent) W.onPresent(W.frames);
+    return W.frameWait(33.4, 'Present');
+  };
+  // The per-frame device methods (7,000-9,000 calls per level-1 frame) skip ComBridge.dispatch: machine.mjs reads
+  // `this` + the arguments itself and calls the thunk's impl(self, args) (com.js's documented method shape).
+  // Everything else, and anything without an impl, still goes through dispatch.
+  const fast = (iface, names) => { for (const n of names) { const i = m.comIndex(iface, n); if (i >= 0 && bridge.thunks[i].impl) m.comFast[i] = bridge.thunks[i].impl; } };
+  fast('IDirect3DDevice8', ['SetRenderState', 'SetTextureStageState', 'SetTexture', 'SetTransform', 'SetStreamSource', 'SetIndices',
+    'SetVertexShader', 'SetLight', 'LightEnable', 'SetMaterial', 'SetViewport', 'ApplyStateBlock', 'DrawPrimitive', 'DrawIndexedPrimitive',
+    'BeginScene', 'EndScene', 'Clear', 'TestCooperativeLevel']);
+  fast('IDirect3DVertexBuffer8', ['Lock', 'Unlock']); fast('IDirect3DIndexBuffer8', ['Lock', 'Unlock']);
   return bridge;
 }
 
@@ -407,12 +413,16 @@ export async function installD3D8(m, W, S, gl, comModule) {
 export function nullGL(width = 640, height = 480) {
   const counts = new Map();
   const target = { canvas: { width, height, style: {} }, counts, drawingBufferWidth: width, drawingBufferHeight: height };
+  // one function per property name, made on first use (a new closure per access was 40 % of all JS garbage in a
+  // perf_node play run: the Node numbers would overstate the browser's GC)
+  const fns = new Map();
   return new Proxy(target, {
     get(t, p) {
       if (p in t) return t[p];
       if (typeof p === 'symbol') return undefined;
-      if (/^[A-Z0-9_]+$/.test(p)) return 0x1000 + p.length;          // GL enums: any distinct-ish number
-      return (...a) => {
+      let f = fns.get(p); if (f !== undefined) return f;
+      if (/^[A-Z0-9_]+$/.test(p)) { f = 0x1000 + p.length; fns.set(p, f); return f; }   // GL enums: any distinct-ish number
+      f = (...a) => {
         counts.set(p, (counts.get(p) || 0) + 1);
         if (p === 'getExtension') return null;
         if (p === 'getShaderParameter' || p === 'getProgramParameter') return true;
@@ -425,6 +435,7 @@ export function nullGL(width = 640, height = 480) {
         if (p === 'getError') return 0;
         return undefined;
       };
+      fns.set(p, f); return f;
     },
   });
 }

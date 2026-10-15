@@ -93,11 +93,14 @@ export class ComBridge {
     this.thunks = [];                  // index -> {iface, name, nargs, fn}
     this.vtables = {};                 // iface -> address
     this.objs = new Map();             // ptr -> js object
-    this.popBytes = 0; this.log = [];
+    this.popBytes = 0; this.log = []; this._args = [];
     this.d3d = null;
     for (const [iface, names] of Object.entries(VTBL)) this.buildVtable(iface, names);
   }
-  get dv(){ return new DataView(this.memory.buffer); }
+  /** DataView over wasm memory, re-created only when memory.grow() replaced the buffer (was one per access). */
+  get dv(){ const b = this.memory.buffer; if (this._buf !== b){ this._buf = b; this._dv = new DataView(b); this._f32 = new Float32Array(b); } return this._dv; }
+  /** Float32Array over the whole wasm memory (same lifetime as dv). */
+  get f32all(){ if (this._buf !== this.memory.buffer) this.dv; return this._f32; }
   u32(a){ return this.dv.getUint32(a, true); } f32(a){ return this.dv.getFloat32(a, true); }
   w32(a, v){ this.dv.setUint32(a, v >>> 0, true); }
   bytes(a, n){ return new Uint8Array(this.memory.buffer, a, n); }
@@ -105,7 +108,7 @@ export class ComBridge {
     const vt = this.heap.alloc(names.length * 4).ptr;
     names.forEach((name, i) => {
       const idx = this.thunks.length;
-      this.thunks.push({iface, name, nargs: NARGS[iface + "::" + name] ?? NARGS[name] ?? 0, impl: this.impl(iface, name)});
+      this.thunks.push({iface, name, nargs: NARGS[iface + "::" + name] ?? NARGS[name] ?? 0, impl: this.impl(iface, name), fast: this.fastImpl(iface, name)});
       this.w32(vt + i * 4, THUNK_BASE + idx * 4);
     });
     this.vtables[iface] = vt;
@@ -122,9 +125,14 @@ export class ComBridge {
   dispatch(idx, esp){
     const t = this.thunks[idx];
     if (!t) throw new Error("bad thunk " + idx);
-    const self = this.obj(this.u32(esp + 4)), args = [];
-    for (let i = 0; i < t.nargs; i++) args.push(this.u32(esp + 8 + i * 4));
+    const dv = this.dv, p = dv.getUint32(esp + 4, true);
+    // `this` is the device for nearly every call: one-entry cache in front of the object map
+    const self = p === this._lp ? this._lo : (this._lp = p, this._lo = this.objs.get(p));
     this.popBytes = 4 + 4 * t.nargs;
+    if (t.fast) return t.fast(self, dv, esp + 8) | 0;           // hot methods read their arguments in place
+    // one reused argument array per arity (impls read their arguments at once and never keep the array)
+    const args = this._args[t.nargs] || (this._args[t.nargs] = new Array(t.nargs).fill(0));
+    for (let i = 0; i < t.nargs; i++) args[i] = dv.getUint32(esp + 8 + i * 4, true);
     if (!t.impl){ this.log.push(`unimplemented ${t.iface}::${t.name}`); return HR.INVALIDCALL; }
     const r = t.impl(self, args);
     return (r === undefined ? 0 : r) | 0;
@@ -133,15 +141,39 @@ export class ComBridge {
   thunkFunctions(){ return this.thunks.map((_, i) => esp => this.dispatch(i, esp)); }
 
   /* -------------------------------------------------- struct readers (d3d8types.h layouts) */
-  matrix(p){ return new Float32Array(this.memory.buffer.slice(p, p + 64)); }
+  // matrix / viewport / material / light fill reused scratch objects (~430 SetTransform, 115 SetLight per frame): a result
+  // is valid until the next call of the same reader. The device copies what it keeps and clones what a state block records.
+  /** D3DMATRIX at p as a Float32Array(16) scratch copy. */
+  matrix(p){
+    const m = this._mat || (this._mat = new Float32Array(16));
+    if ((p & 3) === 0){ const f = this.f32all, i = p >>> 2; for (let k = 0; k < 16; k++) m[k] = f[i + k]; }
+    else new Uint8Array(m.buffer).set(new Uint8Array(this.memory.buffer, p, 64));
+    return m;
+  }
+  /** RECT at p (a fresh object: Clear / CopyRects keep lists of them; a few calls per frame). */
   rect(p){ return p ? {left: this.u32(p) | 0, top: this.u32(p + 4) | 0, right: this.u32(p + 8) | 0, bottom: this.u32(p + 12) | 0} : null; }
   color(p){ return [this.f32(p), this.f32(p + 4), this.f32(p + 8), this.f32(p + 12)]; }
-  viewport(p){ return {X: this.u32(p), Y: this.u32(p + 4), Width: this.u32(p + 8), Height: this.u32(p + 12), MinZ: this.f32(p + 16), MaxZ: this.f32(p + 20)}; }
-  material(p){ return {Diffuse: this.color(p), Ambient: this.color(p + 16), Specular: this.color(p + 32), Emissive: this.color(p + 48), Power: this.f32(p + 64)}; }
-  light(p){ const v = o => [this.f32(p + o), this.f32(p + o + 4), this.f32(p + o + 8)];
-    return {Type: this.u32(p), Diffuse: this.color(p + 4), Specular: this.color(p + 20), Ambient: this.color(p + 36), Position: v(52), Direction: v(64),
-      Range: this.f32(p + 76), Falloff: this.f32(p + 80), Attenuation0: this.f32(p + 84), Attenuation1: this.f32(p + 88), Attenuation2: this.f32(p + 92),
-      Theta: this.f32(p + 96), Phi: this.f32(p + 100)}; }
+  floatsInto(a, p, n){ const dv = this.dv; for (let k = 0; k < n; k++) a[k] = dv.getFloat32(p + 4 * k, true); return a; }
+  viewport(p){
+    const v = this._vp || (this._vp = {X: 0, Y: 0, Width: 0, Height: 0, MinZ: 0, MaxZ: 0}), dv = this.dv;
+    v.X = dv.getUint32(p, true); v.Y = dv.getUint32(p + 4, true); v.Width = dv.getUint32(p + 8, true); v.Height = dv.getUint32(p + 12, true);
+    v.MinZ = dv.getFloat32(p + 16, true); v.MaxZ = dv.getFloat32(p + 20, true); return v;
+  }
+  material(p){
+    const m = this._mtl || (this._mtl = {Diffuse: [0, 0, 0, 0], Ambient: [0, 0, 0, 0], Specular: [0, 0, 0, 0], Emissive: [0, 0, 0, 0], Power: 0});
+    this.floatsInto(m.Diffuse, p, 4); this.floatsInto(m.Ambient, p + 16, 4); this.floatsInto(m.Specular, p + 32, 4); this.floatsInto(m.Emissive, p + 48, 4);
+    m.Power = this.dv.getFloat32(p + 64, true); return m;
+  }
+  light(p){
+    const l = this._lt || (this._lt = {Type: 0, Diffuse: [0, 0, 0, 0], Specular: [0, 0, 0, 0], Ambient: [0, 0, 0, 0], Position: [0, 0, 0], Direction: [0, 0, 0],
+      Range: 0, Falloff: 0, Attenuation0: 0, Attenuation1: 0, Attenuation2: 0, Theta: 0, Phi: 0}), dv = this.dv;
+    l.Type = dv.getUint32(p, true);
+    this.floatsInto(l.Diffuse, p + 4, 4); this.floatsInto(l.Specular, p + 20, 4); this.floatsInto(l.Ambient, p + 36, 4);
+    this.floatsInto(l.Position, p + 52, 3); this.floatsInto(l.Direction, p + 64, 3);
+    l.Range = dv.getFloat32(p + 76, true); l.Falloff = dv.getFloat32(p + 80, true); l.Attenuation0 = dv.getFloat32(p + 84, true);
+    l.Attenuation1 = dv.getFloat32(p + 88, true); l.Attenuation2 = dv.getFloat32(p + 92, true); l.Theta = dv.getFloat32(p + 96, true); l.Phi = dv.getFloat32(p + 100, true);
+    return l;
+  }
   pp(p){ return {BackBufferWidth: this.u32(p), BackBufferHeight: this.u32(p + 4), BackBufferFormat: this.u32(p + 8), BackBufferCount: this.u32(p + 12),
     MultiSampleType: this.u32(p + 16), SwapEffect: this.u32(p + 20), hDeviceWindow: this.u32(p + 24), Windowed: this.u32(p + 28),
     EnableAutoDepthStencil: this.u32(p + 32), AutoDepthStencilFormat: this.u32(p + 36), Flags: this.u32(p + 40)}; }
@@ -179,19 +211,21 @@ export class ComBridge {
       GetDisplayMode: (d, [p]) => { [d.width, d.height, 60, d.backFormat].forEach((v, k) => B.w32(p + 4 * k, v)); return 0; },
       GetCreationParameters: (d, [p]) => { [0, 1, d.hwnd || 0, d.createFlags || 0x40].forEach((v, k) => B.w32(p + 4 * k, v)); return 0; },
       Present: d => d.Present(), BeginScene: d => d.BeginScene(), EndScene: d => d.EndScene(),
-      Clear: (d, [n, pr, flags, color, z, st]) => d.Clear(n, pr ? [...Array(n)].map((_, i) => B.rect(pr + 16 * i)) : null, flags, color, asFloat(z), st),
-      SetTransform: (d, [t, pm]) => d.SetTransform(t, B.matrix(pm)),
+      // the per-frame methods index the argument array (recomp/host/machine.mjs calls them with one reused array;
+      // a destructured parameter goes through the array iterator on every call)
+      Clear: (d, a) => { const n = a[0], pr = a[1]; return d.Clear(n, pr ? [...Array(n)].map((_, i) => B.rect(pr + 16 * i)) : null, a[2], a[3], asFloat(a[4]), a[5]); },
+      SetTransform: (d, a) => d.SetTransform(a[0], B.matrix(a[1])),
       GetTransform: (d, [t, pm]) => { B.bytes(pm, 64).set(new Uint8Array(d.GetTransform(t).buffer)); return 0; },
-      SetViewport: (d, [p]) => d.SetViewport(B.viewport(p)),
+      SetViewport: (d, a) => d.SetViewport(B.viewport(a[0])),
       GetViewport: (d, [p]) => { const v = d.GetViewport(); [v.X, v.Y, v.Width, v.Height].forEach((x, k) => B.w32(p + 4 * k, x)); B.dv.setFloat32(p + 16, v.MinZ, true); B.dv.setFloat32(p + 20, v.MaxZ, true); return 0; },
-      SetMaterial: (d, [p]) => d.SetMaterial(B.material(p)),
-      SetLight: (d, [i, p]) => d.SetLight(i, B.light(p)), LightEnable: (d, [i, on]) => d.LightEnable(i, !!on),
-      SetRenderState: (d, [s, v]) => d.SetRenderState(s, v), GetRenderState: (d, [s, p]) => (B.w32(p, d.GetRenderState(s)), 0),
-      SetTextureStageState: (d, [st, s, v]) => d.SetTextureStageState(st, s, v),
+      SetMaterial: (d, a) => d.SetMaterial(B.material(a[0])),
+      SetLight: (d, a) => d.SetLight(a[0], B.light(a[1])), LightEnable: (d, a) => d.LightEnable(a[0], !!a[1]),
+      SetRenderState: (d, a) => d.SetRenderState(a[0], a[1]), GetRenderState: (d, [s, p]) => (B.w32(p, d.GetRenderState(s)), 0),
+      SetTextureStageState: (d, a) => d.SetTextureStageState(a[0], a[1], a[2]),
       GetTextureStageState: (d, [st, s, p]) => (B.w32(p, d.GetTextureStageState(st, s)), 0),
-      SetTexture: (d, [st, p]) => d.SetTexture(st, B.obj(p)),
+      SetTexture: (d, a) => d.SetTexture(a[0], B.obj(a[1])),
       BeginStateBlock: d => d.BeginStateBlock(), EndStateBlock: (d, [p]) => (B.w32(p, d.EndStateBlock()), 0),
-      ApplyStateBlock: (d, [h]) => d.ApplyStateBlock(h), DeleteStateBlock: (d, [h]) => d.DeleteStateBlock(h),
+      ApplyStateBlock: (d, a) => d.ApplyStateBlock(a[0]), DeleteStateBlock: (d, [h]) => d.DeleteStateBlock(h),
       ValidateDevice: (d, [p]) => (B.w32(p, 1), 0),
       SetGammaRamp: (d, [f, p]) => { const w = k => [...Array(256)].map((_, i) => B.dv.getUint16(p + k * 512 + i * 2, true)); return d.SetGammaRamp(f, {red: w(0), green: w(1), blue: w(2)}); },
       GetGammaRamp: (d, [p]) => { const r = d.GetGammaRamp(); [r.red, r.green, r.blue].forEach((a, k) => a.forEach((v, i) => B.dv.setUint16(p + k * 512 + i * 2, v, true))); return 0; },
@@ -201,10 +235,10 @@ export class ComBridge {
       GetRenderTarget: (d, [pp]) => { B.w32(pp, B.wrap(d.GetRenderTarget(), "IDirect3DSurface8")); return 0; },
       CopyRects: (d, [src, pr, n, dst, pts]) => d.CopyRects(B.obj(src), pr ? [...Array(n)].map((_, i) => B.rect(pr + 16 * i)) : null, B.obj(dst),
         pts ? [{x: B.u32(pts), y: B.u32(pts + 4)}] : null),
-      SetVertexShader: (d, [h]) => d.SetVertexShader(h),
-      SetStreamSource: (d, [n, p, stride]) => d.SetStreamSource(n, B.obj(p), stride),
-      SetIndices: (d, [p, base]) => d.SetIndices(B.obj(p), base),
-      DrawPrimitive: (d, a) => d.DrawPrimitive(...a), DrawIndexedPrimitive: (d, a) => d.DrawIndexedPrimitive(...a),
+      SetVertexShader: (d, a) => d.SetVertexShader(a[0]),
+      SetStreamSource: (d, a) => d.SetStreamSource(a[0], B.obj(a[1]), a[2]),
+      SetIndices: (d, a) => d.SetIndices(B.obj(a[0]), a[1]),
+      DrawPrimitive: (d, a) => d.DrawPrimitive(a[0], a[1], a[2]), DrawIndexedPrimitive: (d, a) => d.DrawIndexedPrimitive(a[0], a[1], a[2], a[3], a[4]),
       DrawPrimitiveUP: (d, [pt, n, pv, stride]) => d.DrawPrimitiveUP(pt, n, B.bytes(pv, d.vcount(pt, n) * stride), stride),
       DrawIndexedPrimitiveUP: (d, [pt, mi, nv, n, pi, ifmt, pv, stride]) =>
         d.DrawIndexedPrimitiveUP(pt, mi, nv, n, B.bytes(pi, d.vcount(pt, n) * (ifmt === FMT.INDEX32 ? 4 : 2)), ifmt, B.bytes(pv, (mi + nv) * stride), stride),
@@ -222,7 +256,7 @@ export class ComBridge {
       UnlockRect: s => s.UnlockRect(),
     })[name];
     if (iface === "IDirect3DVertexBuffer8" || iface === "IDirect3DIndexBuffer8") return ({
-      Lock: (b, [off, size, pp, flags]) => { B.w32(pp, b.Lock(off, size, flags).ptr); return 0; },
+      Lock: (b, a) => { B.dv.setUint32(a[2], b.Lock(a[0], a[1], a[3]).ptr, true); return 0; },
       Unlock: b => b.Unlock(),
       GetDesc: (b, [p]) => { const d = b.GetDesc(); [d.Format, d.Type, d.Usage, d.Pool, d.Size, d.FVF].slice(0, b.kind === "vb" ? 6 : 5).forEach((v, k) => B.w32(p + 4 * k, v)); return 0; },
     })[name];
@@ -230,6 +264,32 @@ export class ComBridge {
       DrawTextA: (f, [s, n, pr, fmt, color]) => f.drawText(B.cstr(s, n), B, pr, fmt, color),
       DrawTextW: (f, [s, n, pr, fmt, color]) => f.drawText(B.wstr(s, n), B, pr, fmt, color),
     })[name];
+    return null;
+  }
+  /** Argument-in-place versions of the per-frame hot methods (thousands of calls per frame): (self, DataView, argsPtr).
+   *  Same semantics as impl(); only the dispatch overhead (args array) is gone. */
+  fastImpl(iface, name){
+    const B = this, o = p => (p ? B.objs.get(p) : null);
+    if (iface === "IDirect3DDevice8") return ({
+      SetRenderState: (d, dv, a) => d.SetRenderState(dv.getUint32(a, true), dv.getUint32(a + 4, true)),
+      SetTextureStageState: (d, dv, a) => d.SetTextureStageState(dv.getUint32(a, true), dv.getUint32(a + 4, true), dv.getUint32(a + 8, true)),
+      SetTexture: (d, dv, a) => d.SetTexture(dv.getUint32(a, true), o(dv.getUint32(a + 4, true))),
+      SetTransform: (d, dv, a) => d.SetTransform(dv.getUint32(a, true), B.matrix(dv.getUint32(a + 4, true))),
+      SetVertexShader: (d, dv, a) => d.SetVertexShader(dv.getUint32(a, true)),
+      SetStreamSource: (d, dv, a) => d.SetStreamSource(dv.getUint32(a, true), o(dv.getUint32(a + 4, true)), dv.getUint32(a + 8, true)),
+      SetIndices: (d, dv, a) => d.SetIndices(o(dv.getUint32(a, true)), dv.getUint32(a + 4, true)),
+      LightEnable: (d, dv, a) => d.LightEnable(dv.getUint32(a, true), !!dv.getUint32(a + 4, true)),
+      SetLight: (d, dv, a) => d.SetLight(dv.getUint32(a, true), B.light(dv.getUint32(a + 4, true))),
+      SetViewport: (d, dv, a) => d.SetViewport(B.viewport(dv.getUint32(a, true))),
+      SetMaterial: (d, dv, a) => d.SetMaterial(B.material(dv.getUint32(a, true))),
+      ApplyStateBlock: (d, dv, a) => d.ApplyStateBlock(dv.getUint32(a, true)),
+      DrawPrimitive: (d, dv, a) => d.DrawPrimitive(dv.getUint32(a, true), dv.getUint32(a + 4, true), dv.getUint32(a + 8, true)),
+      DrawIndexedPrimitive: (d, dv, a) => d.DrawIndexedPrimitive(dv.getUint32(a, true), dv.getUint32(a + 4, true), dv.getUint32(a + 8, true), dv.getUint32(a + 12, true), dv.getUint32(a + 16, true)),
+    })[name] || null;
+    if (iface === "IDirect3DVertexBuffer8" || iface === "IDirect3DIndexBuffer8") return ({
+      Lock: (b, dv, a) => { dv.setUint32(dv.getUint32(a + 8, true), b.Lock(dv.getUint32(a, true), dv.getUint32(a + 4, true), dv.getUint32(a + 12, true)).ptr, true); return 0; },
+      Unlock: b => b.Unlock(),
+    })[name] || null;
     return null;
   }
   cstr(p, n){ const u = new Uint8Array(this.memory.buffer); let e = p; while ((n < 0 || n === 0xffffffff) ? u[e] : e - p < n) e++; return new TextDecoder("latin1").decode(u.slice(p, e)); }
@@ -248,7 +308,7 @@ export class ComBridge {
     put(0xa0, c.MaxActiveLights || 8); put(0xb4, c.MaxPrimitiveCount || 0xfffff); put(0xb8, c.MaxVertexIndex || 0xffffff); put(0xbc, 1); put(0xc0, 255);
   }
   /** Direct3DCreate8(SDKVersion) HLE (IAT slot of d3d8.dll!Direct3DCreate8, thunk 0067da02). */
-  Direct3DCreate8(sdk){ this.d3d = new Direct3D8({alloc: n => this.heap.alloc(n)}); return this.wrap(this.d3d, "IDirect3D8"); }
+  Direct3DCreate8(sdk){ this.d3d = new Direct3D8({alloc: n => this.heap.alloc(n), programCache: "hobbit.d3d8.programs", asyncShaders: true}); return this.wrap(this.d3d, "IDirect3D8"); }
 }
 
 /* ------------------------------------------------------------------ tiny wasm assembler for the bridge modules */
